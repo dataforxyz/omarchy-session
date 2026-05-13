@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: 2026 Ben U
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Install the source-controlled Omarchy workspace/session restore helper.
 set -euo pipefail
 

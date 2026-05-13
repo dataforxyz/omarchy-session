@@ -56,3 +56,9 @@ contain window titles, working directories, command lines, and local session IDs
 
 See [`docs/workspace-session-restore.md`](docs/workspace-session-restore.md) for
 more details.
+
+## License
+
+Copyright (C) 2026 Ben U.
+
+GPL-3.0-or-later. See [`LICENSE`](LICENSE).
