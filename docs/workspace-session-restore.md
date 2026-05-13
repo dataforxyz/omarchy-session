@@ -16,6 +16,7 @@ Installed commands:
 - `ws u` — soft undo: restore the pre-restore undo snapshot
 - `ws uh` / `ws undo-hard` — hard undo: close windows launched by the previous restore only
 - `ws st` / `ws status` — show autosave health, save ages/counts, install path, shortcuts, and last-restore info
+- `ws deps` / `ws doctor` / `ws check` — show required and optional dependency status
 
 The script is source-controlled at `scripts/omarchy-session`. Install it with:
 

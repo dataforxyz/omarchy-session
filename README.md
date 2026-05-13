@@ -34,6 +34,7 @@ ws pick           # pick a profile/autosave using a launcher or terminal picker
 ws u              # soft undo: restore the pre-restore snapshot
 ws uh             # hard undo: close windows launched by the last restore
 ws st             # status/health
+ws deps           # dependency check
 ```
 
 Runtime state lives in:
@@ -50,7 +51,6 @@ contain window titles, working directories, command lines, and local session IDs
 - Linux with Hyprland
 - Python 3
 - `hyprctl`
-- `jq`
 - Ghostty for the most complete terminal restore behavior
 - Optional picker: Walker, wofi, fuzzel, or rofi
 

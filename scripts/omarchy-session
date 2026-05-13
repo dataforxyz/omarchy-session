@@ -33,6 +33,18 @@ SINGLETON_CLASSES = {
     "google-chrome", "google-chrome-stable", "firefox", "firefoxdeveloperedition",
     "slack", "discord", "signal", "signal-desktop", "obsidian", "thunderbird", "keepassxc",
 }
+REQUIRED_COMMANDS = ("hyprctl",)
+OPTIONAL_COMMAND_GROUPS = {
+    "terminal restore": ("ghostty",),
+    "notifications/session supervision": ("notify-send", "uwsm"),
+    "pick menu": ("walker", "wofi", "fuzzel", "rofi"),
+    "web apps": ("omarchy-launch-webapp",),
+    "app restore targets": (
+        "chromium", "brave", "google-chrome-stable", "firefox", "obsidian", "slack",
+        "discord", "signal-desktop", "nautilus", "thunderbird", "keepassxc", "code",
+    ),
+    "agent resume helpers": ("pi", "claude", "codex", "opencode"),
+}
 
 
 def notify(title: str, body: str = "") -> None:
@@ -43,6 +55,31 @@ def notify(title: str, body: str = "") -> None:
 def require(cmd: str) -> None:
     if not shutil.which(cmd):
         print(f"Missing required command: {cmd}", file=sys.stderr)
+        sys.exit(1)
+
+
+def dependency_status() -> None:
+    print("Omarchy session dependencies")
+    print(f"  python: {sys.version.split()[0]} ({sys.executable})")
+
+    missing_required = []
+    for cmd in REQUIRED_COMMANDS:
+        path = shutil.which(cmd)
+        if path:
+            print(f"  required: {cmd:<24} ok ({path})")
+        else:
+            print(f"  required: {cmd:<24} missing")
+            missing_required.append(cmd)
+
+    for group, commands in OPTIONAL_COMMAND_GROUPS.items():
+        present = [cmd for cmd in commands if shutil.which(cmd)]
+        missing = [cmd for cmd in commands if not shutil.which(cmd)]
+        present_text = ", ".join(present) if present else "none"
+        missing_text = ", ".join(missing) if missing else "none"
+        print(f"  optional: {group:<24} present: {present_text}; missing: {missing_text}")
+
+    if missing_required:
+        print("\nMissing required commands prevent save/restore from reading Hyprland state.", file=sys.stderr)
         sys.exit(1)
 
 
@@ -320,7 +357,6 @@ def monitor_name_by_id() -> dict[int, str]:
 
 def collect_windows() -> list[dict]:
     require("hyprctl")
-    require("jq")  # not used by this script, but useful signal that the original dependency exists
     clients = raw_clients()
     windows = []
     proc_children = child_map()
@@ -1171,7 +1207,7 @@ def health_status() -> None:
         print("  last restore: missing")
     print("  shortcuts:")
     print(shortcuts_help_block())
-    print("  commands: ws s, ws r, ws pick, ws a, ws as, ws u, ws undo-hard, ws status")
+    print("  commands: ws s, ws r, ws pick, ws a, ws as, ws u, ws undo-hard, ws status, ws deps")
 
 
 def list_session(path: Path = SESSION_FILE) -> None:
@@ -1217,9 +1253,10 @@ Short commands:
   u           undo/restore pre-restore state
   uh          hard undo: close windows launched by the last restore
   st          status/health
+  deps        dependency check
 
 Full commands still work:
-  save [name], restore [name], list [name], profiles, pick [restore|list|path], autosave, autosaves, undo, undo-hard, status, path [name]
+  save [name], restore [name], list [name], profiles, pick [restore|list|path], autosave, autosaves, undo, undo-hard, status, deps, path [name]
 
 Current shortcuts:
 {shortcuts_help_block()}
@@ -1263,6 +1300,8 @@ def main() -> None:
         hard_undo()
     elif cmd == "status":
         health_status()
+    elif cmd in {"deps", "doctor", "check"}:
+        dependency_status()
     elif cmd in {"list", "show"}:
         list_session(session_path(name))
     elif cmd == "list-undo":
