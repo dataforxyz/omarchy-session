@@ -9,6 +9,7 @@ Installed commands:
 
 - `ws s [name]` / `omarchy-session save [name]` — save current windows
 - `ws r [name]` / `omarchy-session restore [name]` — restore only missing windows
+- `ws plan [name]`, `ws dry-run [name]`, or `ws r --dry-run [name]` — print the restore plan without launches, Hyprland dispatches, undo/last-restore writes, notifications, or sleeps
 - `ws a` — write a timestamped autosave
 - `ws as` — list autosaves
 - `ws p` — list named profiles and recent autosaves
@@ -31,10 +32,45 @@ repo copy:
 scripts/install-omarchy-session.sh --link
 ```
 
-Runtime state lives in `~/.local/state/omarchy-session/` and includes autosaves,
-named profiles, and the undo snapshot. Review those files before sharing them;
-they can contain window titles, working directories, command lines, and local
-session IDs.
+The installer does not replace unrelated existing `~/.local/bin/ws` or
+`~/.local/bin/restore-workspace` entries by default. It refreshes aliases that
+are missing or already point to `omarchy-session`; pass `--force` to replace
+unrelated aliases and keep the historical clobbering behavior.
+
+## Dry-run restore plans
+
+Use `ws plan [name]`, `ws dry-run [name]`, `ws r --dry-run [name]`, or
+`omarchy-session restore --dry-run [name]` to inspect what restore would do. The
+plan loads the saved session and compares it with the current Hyprland windows.
+It reports windows that are already open, windows that would be launched, windows
+that would be skipped because the app class or optional command is unavailable,
+and monitor/group/focus actions that would be attempted.
+
+Dry-run mode is intentionally read-only: it does not call Hyprland dispatch,
+launch apps, write the undo snapshot, write `last-restore.json`, send desktop
+notifications, or sleep between launches. Missing or corrupt session files still
+fail; skipped optional apps are reported in the plan without making dry-run fail.
+
+## Privacy and saved state
+
+Runtime state lives in `~/.local/state/omarchy-session/` and includes:
+
+- `last-session.json` — default save;
+- `profiles/*.json` — named profiles;
+- `autosaves/*.json` and `autosaves/latest.json` — autosave history;
+- `before-last-restore.json` — soft-undo snapshot;
+- `last-restore.json` — windows launched by the most recent real restore.
+
+Review those files before sharing them. They can contain window titles, window
+classes, workspace and monitor names, host name, timestamps, process IDs,
+`procCmdline`, `procArgv`, `procCwd`, `restoreWorkdir`, `restoreArgv`,
+`agentSession`, `piSession`, and restore command hints. The tool reads local
+Hyprland window metadata, `/proc` process command lines/working directories, and
+local Pi/Claude/Codex/OpenCode session metadata to make restore more useful; it
+does not intentionally collect secrets, but commands, paths, titles, and agent
+session IDs can reveal private project names, server names, prompts, URLs, or
+other sensitive context. Use synthetic or redacted data for bug reports and test
+fixtures.
 
 Hyprland grouped tabs created with `Super+G` are saved from Hyprland's `grouped`
 metadata. Restore recreates those groups best-effort after windows are relaunched

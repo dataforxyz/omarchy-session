@@ -16,9 +16,13 @@ For development, link the command to this checkout instead of copying it:
 scripts/install-omarchy-session.sh --link
 ```
 
-This installs:
+The installer refreshes `ws` and `restore-workspace` only when they are absent
+or already point to `omarchy-session`. If either name is an unrelated existing
+file or symlink, it is left untouched with a warning; use `--force` to replace it.
 
-- `omarchy-session`
+This installs `omarchy-session` and provides these aliases when they are not
+skipped for safety:
+
 - `ws`
 - `restore-workspace`
 
@@ -27,6 +31,8 @@ This installs:
 ```bash
 ws s [name]       # save current session/profile
 ws r [name]       # restore missing windows
+ws plan [name]    # dry-run restore plan; no launches, dispatches, writes, or sleeps
+ws r --dry-run [name]
 ws a              # autosave now
 ws as             # list autosaves
 ws p              # list profiles and recent autosaves
@@ -37,14 +43,24 @@ ws st             # status/health
 ws deps           # dependency check
 ```
 
+## Privacy and saved state
+
 Runtime state lives in:
 
 ```text
 ~/.local/state/omarchy-session/
 ```
 
-Do not publish runtime state files unless you have reviewed them. They can
-contain window titles, working directories, command lines, and local session IDs.
+By default that directory contains the latest save (`last-session.json`), named
+profiles (`profiles/*.json`), autosaves (`autosaves/*.json`), the soft-undo
+snapshot (`before-last-restore.json`), and the last restore launch record
+(`last-restore.json`).
+
+Treat these files as private. They are local JSON, but can include sensitive
+workflow details such as `procCmdline`, `procArgv`, `restoreWorkdir`,
+`agentSession` IDs/paths, host name, timestamps, window classes, window titles,
+workspace/monitor names, process IDs, and restore command hints. Review and
+redact them before sharing bug reports, screenshots, test fixtures, or commits.
 
 ## Requirements
 

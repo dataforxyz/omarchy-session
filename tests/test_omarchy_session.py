@@ -1,0 +1,178 @@
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = REPO_ROOT / "scripts" / "omarchy-session"
+INSTALLER = REPO_ROOT / "scripts" / "install-omarchy-session.sh"
+
+
+def load_module():
+    loader = importlib.machinery.SourceFileLoader("omarchy_session_test", str(SCRIPT))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class DryRunTests(unittest.TestCase):
+    def test_restore_dry_run_reports_plan_without_side_effects(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            workdir = tmp_path / "project"
+            workdir.mkdir()
+            session = tmp_path / "session.json"
+            session.write_text(json.dumps({
+                "savedAt": "2026-05-13T00:00:00Z",
+                "activeWindow": {"address": "0xactive", "workspace": {"id": 1, "name": "1"}},
+                "windows": [
+                    {
+                        "address": "0x1",
+                        "class": "firefox",
+                        "title": "Already here",
+                        "workspace": {"id": 1, "name": "1"},
+                        "monitorName": "HDMI-A-1",
+                    },
+                    {
+                        "address": "0x2",
+                        "class": "ghostty",
+                        "title": "Terminal",
+                        "workspace": {"id": 2, "name": "2"},
+                        "monitorName": "HDMI-A-1",
+                        "restoreWorkdir": str(workdir),
+                        "restoreArgv": ["bash"],
+                        "grouped": ["0x2", "0x3"],
+                    },
+                    {
+                        "address": "0x3",
+                        "class": "mystery-app",
+                        "title": "Unknown",
+                        "workspace": {"id": 2, "name": "2"},
+                        "monitorName": "HDMI-A-1",
+                        "grouped": ["0x2", "0x3"],
+                    },
+                    {
+                        "address": "0x4",
+                        "class": "obsidian",
+                        "title": "Notes",
+                        "workspace": {"id": 3, "name": "3"},
+                        "monitorName": "HDMI-A-1",
+                    },
+                ],
+            }))
+
+            mod.collect_windows = lambda: [{
+                "address": "0xc1",
+                "class": "firefox",
+                "title": "Already here",
+                "workspace": {"id": 1, "name": "1"},
+            }]
+            mod.raw_monitors = lambda: [{"name": "HDMI-A-1"}]
+
+            def forbidden(*args, **kwargs):
+                raise AssertionError("dry-run called a side-effect function")
+
+            mod.hypr = forbidden
+            mod.hypr_exec_on_workspace = forbidden
+            mod.write_session = forbidden
+            mod.write_last_restore = forbidden
+            mod.notify = forbidden
+
+            out = io.StringIO()
+            with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}" if cmd == "ghostty" else None):
+                with mock.patch.object(mod.time, "sleep", forbidden):
+                    with contextlib.redirect_stdout(out):
+                        mod.restore_dry_run(session)
+
+            text = out.getvalue()
+            self.assertIn("already open: workspace 1: firefox", text)
+            self.assertIn("would launch: workspace 2: ghostty", text)
+            self.assertIn("ghostty --working-directory=", text)
+            self.assertIn("skipped: workspace 2: mystery-app", text)
+            self.assertIn("skipped: workspace 3: obsidian", text)
+            self.assertIn("missing command for obsidian: obsidian", text)
+            self.assertIn("Monitor actions:", text)
+            self.assertIn("Group actions: would attempt to restore 1 saved group", text)
+            self.assertIn("Focus actions: would focus saved active window", text)
+            self.assertIn("would launch 1, already open 1, skipped 2", text)
+
+    def test_restore_dry_run_cli_forms(self):
+        mod = load_module()
+        calls = []
+        mod.session_path = lambda name=None: Path(f"/tmp/{name or 'default'}.json")
+        mod.restore_dry_run = lambda path: calls.append(path)
+        mod.restore = lambda *args, **kwargs: self.fail("real restore should not run")
+        for argv in (
+            ["ws", "restore", "demo", "--dry-run"],
+            ["ws", "r", "--dry-run", "demo"],
+            ["ws", "plan", "demo"],
+            ["ws", "dry-run", "demo"],
+        ):
+            with mock.patch.object(sys, "argv", argv):
+                mod.main()
+        self.assertEqual(calls, [Path("/tmp/demo.json")] * 4)
+
+
+class InstallerSafetyTests(unittest.TestCase):
+    def test_installer_refuses_unrelated_alias_unless_forced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = home / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            ws = bin_dir / "ws"
+            ws.write_text("do not replace\n")
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+
+            result = subprocess.run(["bash", str(INSTALLER), "--copy"], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            self.assertIn("refusing to replace unrelated", result.stderr)
+            self.assertEqual(ws.read_text(), "do not replace\n")
+            self.assertTrue((bin_dir / "restore-workspace").is_symlink())
+
+            subprocess.run(["bash", str(INSTALLER), "--copy", "--force"], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            self.assertTrue(ws.is_symlink())
+            self.assertEqual(os.readlink(ws), "omarchy-session")
+
+    def test_installer_preserves_unrelated_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = home / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            ws = bin_dir / "ws"
+            ws.symlink_to("other-tool")
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+
+            result = subprocess.run(["bash", str(INSTALLER), "--copy"], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            self.assertIn("refusing to replace unrelated", result.stderr)
+            self.assertTrue(ws.is_symlink())
+            self.assertEqual(os.readlink(ws), "other-tool")
+
+    def test_installer_refreshes_existing_managed_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = home / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            ws = bin_dir / "ws"
+            ws.symlink_to("omarchy-session")
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+
+            result = subprocess.run(["bash", str(INSTALLER), "--copy"], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            self.assertIn("Refreshed", result.stdout)
+            self.assertTrue(ws.is_symlink())
+            self.assertEqual(os.readlink(ws), "omarchy-session")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -636,9 +636,10 @@ def monitor_target(win: dict) -> str:
     return ""
 
 
-def restore_workspace_monitors(targets: list[dict]) -> int:
+def workspace_monitor_moves(targets: list[dict]) -> list[tuple[str, str]]:
     available_names = {m.get("name") for m in raw_monitors() if m.get("name")}
-    moved: set[tuple[str, str]] = set()
+    moves: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for win in targets:
         ws = workspace_spec(win)
         if not ws or ws.startswith("special:"):
@@ -649,11 +650,18 @@ def restore_workspace_monitors(targets: list[dict]) -> int:
         if available_names and not monitor.isdigit() and monitor not in available_names:
             continue
         key = (ws, monitor)
-        if key in moved:
+        if key in seen:
             continue
+        seen.add(key)
+        moves.append(key)
+    return moves
+
+
+def restore_workspace_monitors(targets: list[dict]) -> int:
+    moves = workspace_monitor_moves(targets)
+    for ws, monitor in moves:
         hypr("dispatch", "moveworkspacetomonitor", f"{ws} {monitor}")
-        moved.add(key)
-    return len(moved)
+    return len(moves)
 
 
 def find_new_window(target: dict, before_addresses: set[str], timeout: float = 6.0) -> dict | None:
@@ -879,7 +887,7 @@ def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str
     return False
 
 
-def launch(win: dict) -> bool:
+def launch_command(win: dict) -> tuple[list[str] | None, str]:
     cls = lc_class(win)
     workdir = win.get("restoreWorkdir") or ""
     webapp_url, webapp_flags = browser_app_args(win)
@@ -920,15 +928,104 @@ def launch(win: dict) -> bool:
         cmd = ["code", workdir] if workdir and Path(workdir).is_dir() else ["code"]
 
     if not cmd:
-        print(f"Skipping unknown app class: {win.get('class')} — {win.get('title')}", file=sys.stderr)
-        return False
+        return None, f"unknown app class: {win.get('class')} — {win.get('title')}"
     if not shutil.which(cmd[0]):
-        print(f"Skipping missing command for {win.get('class')}: {cmd[0]}", file=sys.stderr)
+        return None, f"missing command for {win.get('class')}: {cmd[0]}"
+    return cmd, ""
+
+
+def launch(win: dict) -> bool:
+    cmd, skip_reason = launch_command(win)
+    if not cmd:
+        print(f"Skipping {skip_reason}", file=sys.stderr)
         return False
 
     ws = workspace_spec(win)
     hypr_exec_on_workspace(cmd, ws)
     return True
+
+
+def planned_group_count(targets: list[dict]) -> int:
+    grouped_targets: set[tuple[str, ...]] = set()
+    for win in targets:
+        grouped = tuple(win.get("grouped") or [])
+        if len(grouped) > 1:
+            grouped_targets.add(grouped)
+    return len(grouped_targets)
+
+
+def planned_focus_action(data: dict) -> str:
+    active = data.get("activeWindow") or {}
+    if not active:
+        return "would preserve current focus if possible (session has no saved active window)"
+    saved_address = active.get("address") or ""
+    if saved_address:
+        return f"would focus saved active window if matched: address:{saved_address}"
+    active_key = active.get("restoreKey") or ""
+    if active_key:
+        return f"would focus first window matching saved restore key: {active_key}"
+    ws = workspace_from_snapshot(active)
+    if ws:
+        return f"would switch to saved active workspace: {ws}"
+    return "would preserve current focus if possible"
+
+
+def window_summary(win: dict) -> str:
+    title = win.get("title") or ""
+    title_part = f" — {title}" if title else ""
+    return f"workspace {workspace_spec(win)}: {win.get('class')}{title_part}"
+
+
+def restore_dry_run(path: Path) -> None:
+    data = load_session(path)
+    targets = [w for w in data.get("windows", []) if workspace_spec(w) != "0"]
+    current_windows = collect_windows()
+    current_counts = Counter(restore_key(w) for w in current_windows)
+    monitor_moves = workspace_monitor_moves(targets)
+    group_count = planned_group_count(targets)
+    launched = 0
+    skipped_open = 0
+    skipped_unknown = 0
+
+    print(f"Restore dry-run for {path}")
+    print(f"Saved windows considered: {len(targets)}; current windows: {len(current_windows)}")
+    if monitor_moves:
+        print("Monitor actions:")
+        for ws, monitor in monitor_moves:
+            print(f"  would move workspace {ws} to monitor {monitor}")
+    else:
+        print("Monitor actions: none")
+
+    print("Window actions:")
+    if not targets:
+        print("  none")
+    for win in targets:
+        key = restore_key(win)
+        label = window_summary(win)
+        if current_counts[key] > 0:
+            if not is_singleton(win):
+                current_counts[key] -= 1
+            skipped_open += 1
+            print(f"  already open: {label}")
+            continue
+
+        cmd, skip_reason = launch_command(win)
+        if cmd:
+            launched += 1
+            if is_singleton(win) or is_webapp(win):
+                current_counts[key] += 1
+            print(f"  would launch: {label} -> {shlex.join(cmd)}")
+        else:
+            skipped_unknown += 1
+            print(f"  skipped: {label} ({skip_reason})")
+
+    if group_count:
+        print(f"Group actions: would attempt to restore {group_count} saved group(s)")
+    else:
+        print("Group actions: none")
+    print(f"Focus actions: {planned_focus_action(data)}")
+    monitor_note = f", monitor placements {len(monitor_moves)}" if monitor_moves else ""
+    print(f"Dry-run checked {len(targets)} saved windows: would launch {launched}, already open {skipped_open}, skipped {skipped_unknown}, groups to restore {group_count}{monitor_note}")
 
 
 def write_last_restore(source: Path, launched_windows: list[dict]) -> None:
@@ -1207,7 +1304,7 @@ def health_status() -> None:
         print("  last restore: missing")
     print("  shortcuts:")
     print(shortcuts_help_block())
-    print("  commands: ws s, ws r, ws pick, ws a, ws as, ws u, ws undo-hard, ws status, ws deps")
+    print("  commands: ws s, ws r, ws plan, ws pick, ws a, ws as, ws u, ws undo-hard, ws status, ws deps")
 
 
 def list_session(path: Path = SESSION_FILE) -> None:
@@ -1245,6 +1342,7 @@ def usage() -> None:
 Short commands:
   s [name]    save
   r [name]    restore only missing windows
+  plan [name] dry-run restore plan (no dispatch, launches, writes, notifications, or sleeps)
   l [name]    list
   p           profiles/named setups
   pick        pick a profile/autosave and restore it
@@ -1256,7 +1354,7 @@ Short commands:
   deps        dependency check
 
 Full commands still work:
-  save [name], restore [name], list [name], profiles, pick [restore|list|path], autosave, autosaves, undo, undo-hard, status, deps, path [name]
+  save [name], restore [--dry-run|--plan] [name], plan [name], dry-run [name], list [name], profiles, pick [restore|list|path], autosave, autosaves, undo, undo-hard, status, deps, path [name]
 
 Current shortcuts:
 {shortcuts_help_block()}
@@ -1268,8 +1366,29 @@ Files:
 """)
 
 
+def parse_name_and_restore_flags(args: list[str]) -> tuple[str | None, bool]:
+    name: str | None = None
+    dry_run = False
+    for arg in args:
+        if arg in {"--dry-run", "--plan", "-n"}:
+            dry_run = True
+        elif arg in {"--"}:
+            continue
+        elif arg.startswith("-"):
+            print(f"Unknown option: {arg}", file=sys.stderr)
+            sys.exit(2)
+        elif name is None:
+            name = arg
+        else:
+            print(f"Unexpected extra argument: {arg}", file=sys.stderr)
+            sys.exit(2)
+    return name, dry_run
+
+
 def main() -> None:
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    args = sys.argv[1:]
+    cmd = args[0] if args else ""
+    rest = args[1:] if args else []
     aliases = {
         "s": "save",
         "r": "restore",
@@ -1284,7 +1403,7 @@ def main() -> None:
         "st": "status",
     }
     cmd = aliases.get(cmd, cmd)
-    name = sys.argv[2] if len(sys.argv) > 2 else None
+    name, dry_run = parse_name_and_restore_flags(rest)
     if cmd == "save":
         write_session(session_path(name))
     elif cmd == "autosave":
@@ -1293,7 +1412,12 @@ def main() -> None:
     elif cmd == "autosave-loop":
         autosave_loop()
     elif cmd in {"restore", "start"}:
-        restore(session_path(name), save_undo=True)
+        if dry_run:
+            restore_dry_run(session_path(name))
+        else:
+            restore(session_path(name), save_undo=True)
+    elif cmd in {"plan", "dry-run"}:
+        restore_dry_run(session_path(name))
     elif cmd == "undo":
         restore(UNDO_FILE, save_undo=False)
     elif cmd in {"undo-hard", "hard-undo"}:
@@ -1309,7 +1433,7 @@ def main() -> None:
     elif cmd in {"profiles", "setups"}:
         list_profiles()
     elif cmd == "pick":
-        pick_session(sys.argv[2] if len(sys.argv) > 2 else "restore")
+        pick_session(name or "restore")
     elif cmd in {"autosaves", "list-autosaves"}:
         list_autosaves()
     elif cmd == "path":
