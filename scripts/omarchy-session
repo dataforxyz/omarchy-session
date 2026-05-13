@@ -1,0 +1,1281 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy-session"
+SESSION_FILE = STATE_DIR / "last-session.json"
+UNDO_FILE = STATE_DIR / "before-last-restore.json"
+LAST_RESTORE_FILE = STATE_DIR / "last-restore.json"
+AUTOSAVE_DIR = STATE_DIR / "autosaves"
+LATEST_AUTOSAVE = AUTOSAVE_DIR / "latest.json"
+PROFILE_DIR = STATE_DIR / "profiles"
+AUTOSAVE_KEEP = 48
+PI_SESSION_ROOT = Path.home() / ".pi/agent/sessions"
+CLAUDE_PROJECT_ROOT = Path.home() / ".claude/projects"
+CODEX_SESSION_ROOT = Path.home() / ".codex/sessions"
+OPENCODE_DB = Path.home() / ".local/share/opencode/opencode.db"
+MAKE_RESTORE_TARGETS = {"ssh", "pi", "claude", "codex", "opencode"}
+DIRECT_RESTORE_COMMANDS = {"ssh", "tmux", "claude", "codex", "opencode"}
+EXCLUDED_CLASSES = {"zenity", "pinentry", "org.gnome.polkit", "xdg-desktop-portal"}
+SINGLETON_CLASSES = {
+    "chromium", "chromium-browser", "brave-browser", "brave",
+    "google-chrome", "google-chrome-stable", "firefox", "firefoxdeveloperedition",
+    "slack", "discord", "signal", "signal-desktop", "obsidian", "thunderbird", "keepassxc",
+}
+
+
+def notify(title: str, body: str = "") -> None:
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", title, body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def require(cmd: str) -> None:
+    if not shutil.which(cmd):
+        print(f"Missing required command: {cmd}", file=sys.stderr)
+        sys.exit(1)
+
+
+def read_proc_argv(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+    except Exception:
+        return []
+
+
+def read_proc_cwd(pid: int) -> str:
+    try:
+        return str(Path(f"/proc/{pid}/cwd").resolve())
+    except Exception:
+        return ""
+
+
+def proc_info(pid: int) -> tuple[str, str, str, list[str]]:
+    cwd = ""
+    cmdline = ""
+    workdir = ""
+    argv: list[str] = []
+
+    cwd = read_proc_cwd(pid)
+    argv = read_proc_argv(pid)
+    cmdline = " ".join(shlex.quote(part) for part in argv)
+
+    parts = argv or shlex.split(cmdline)
+    for i, part in enumerate(parts):
+        if part.startswith("--working-directory="):
+            workdir = part.split("=", 1)[1]
+            break
+        if part == "--working-directory" and i + 1 < len(parts):
+            workdir = parts[i + 1]
+            break
+
+    workdir = workdir.strip("'\"") or cwd
+    return cwd, cmdline, workdir, argv
+
+
+def child_map() -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            pid = int(proc.name)
+            for line in (proc / "status").read_text(errors="ignore").splitlines():
+                if line.startswith("PPid:"):
+                    ppid = int(line.split()[1])
+                    children.setdefault(ppid, []).append(pid)
+                    break
+        except Exception:
+            continue
+    return children
+
+
+def descendants(pid: int, children: dict[int, list[int]]) -> list[tuple[int, int]]:
+    found: list[tuple[int, int]] = []
+    stack = [(child, 1) for child in children.get(pid, [])]
+    while stack:
+        child, depth = stack.pop()
+        found.append((child, depth))
+        stack.extend((grandchild, depth + 1) for grandchild in children.get(child, []))
+    return found
+
+
+def pi_session_dir_for_cwd(cwd: str) -> Path:
+    encoded = "--" + cwd.strip("/").replace("/", "-") + "--"
+    return PI_SESSION_ROOT / encoded
+
+
+def pi_sessions_for_cwd(cwd: str) -> list[str]:
+    session_dir = pi_session_dir_for_cwd(cwd)
+    try:
+        sessions = [p for p in session_dir.glob("*.jsonl") if p.is_file()]
+    except Exception:
+        return []
+    return [str(p) for p in sorted(sessions, key=lambda p: p.stat().st_mtime, reverse=True)]
+
+
+def latest_pi_session_for_cwd(cwd: str) -> str:
+    sessions = pi_sessions_for_cwd(cwd)
+    return sessions[0] if sessions else ""
+
+
+def choose_unused_session(tool: str, sessions: list[str], used_sessions: dict[str, set[str]]) -> str:
+    used = used_sessions.setdefault(tool, set())
+    for session in sessions:
+        if session not in used:
+            used.add(session)
+            return session
+    if sessions:
+        # If every candidate is already consumed, keep a deterministic fallback
+        # but still return a usable session rather than dropping resume support.
+        return sessions[0]
+    return ""
+
+
+def claude_project_dir_for_cwd(cwd: str) -> Path:
+    # Claude Code stores sessions by cwd with non-alphanumeric characters
+    # replaced by '-': /home/me/src/foo.bar -> -home-me-src-foo-bar.
+    return CLAUDE_PROJECT_ROOT / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def latest_claude_session_for_cwd(cwd: str) -> str:
+    session_dir = claude_project_dir_for_cwd(cwd)
+    try:
+        sessions = [p for p in session_dir.glob("*.jsonl") if p.is_file()]
+    except Exception:
+        return ""
+    if not sessions:
+        return ""
+    return max(sessions, key=lambda p: p.stat().st_mtime).stem
+
+
+def latest_codex_session_for_cwd(cwd: str) -> str:
+    try:
+        sessions = [p for p in CODEX_SESSION_ROOT.rglob("*.jsonl") if p.is_file()]
+    except Exception:
+        return ""
+    best: tuple[float, str] = (0, "")
+    for path in sessions:
+        try:
+            first = path.open(errors="ignore").readline()
+            meta = json.loads(first)
+            payload = meta.get("payload") or {}
+            if payload.get("cwd") != cwd:
+                continue
+            session_id = payload.get("id") or ""
+            if not session_id:
+                continue
+            mtime = path.stat().st_mtime
+            if mtime > best[0]:
+                best = (mtime, session_id)
+        except Exception:
+            continue
+    return best[1]
+
+
+def latest_opencode_session_for_cwd(cwd: str) -> str:
+    if not OPENCODE_DB.exists():
+        return ""
+    try:
+        with sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                """
+                select id from session
+                where directory = ? or path = ?
+                order by time_updated desc
+                limit 1
+                """,
+                (cwd, cwd),
+            ).fetchone()
+    except Exception:
+        return ""
+    return row[0] if row else ""
+
+
+def make_restore_argv(argv: list[str]) -> list[str]:
+    if not argv or Path(argv[0]).name not in {"make", "gmake"}:
+        return []
+    for arg in argv[1:]:
+        if arg.startswith("-") or "=" in arg:
+            continue
+        if arg in MAKE_RESTORE_TARGETS:
+            return argv
+    return []
+
+
+def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]], used_sessions: dict[str, set[str]]) -> tuple[str, list[str], dict]:
+    home = str(Path.home())
+    best = (0, fallback)
+    restore_argv: list[str] = []
+    restore_session: dict = {}
+    kids = sorted(descendants(pid, children), key=lambda item: item[1])
+
+    # Prefer exact local agent resumes when the tool exposes a stable resume
+    # mechanism. This beats rerunning `make claude`/`make codex` because it opens
+    # the saved conversation instead of starting a fresh one.
+    for child_pid, depth in kids:
+        cwd = read_proc_cwd(child_pid)
+        if not cwd:
+            continue
+        argv = read_proc_argv(child_pid)
+        exe = Path(argv[0]).name if argv else ""
+
+        if exe == "pi":
+            sessions = pi_sessions_for_cwd(cwd)
+            session = choose_unused_session("pi", sessions, used_sessions)
+            if session:
+                return cwd, ["pi", "--session", session], {"tool": "pi", "id": session, "path": session, "match": "cwd-newest-unused"}
+            return cwd, ["pi", "--continue"], {"tool": "pi", "id": "latest", "match": "continue"}
+
+        if exe == "claude":
+            session = latest_claude_session_for_cwd(cwd)
+            if session:
+                return cwd, ["claude", "--resume", session], {"tool": "claude", "id": session}
+            return cwd, ["claude", "--continue"], {"tool": "claude", "id": "latest"}
+
+        if exe == "codex":
+            session = latest_codex_session_for_cwd(cwd)
+            if session:
+                return cwd, ["codex", "resume", session], {"tool": "codex", "id": session}
+            return cwd, ["codex", "resume", "--last"], {"tool": "codex", "id": "latest"}
+
+        if exe == "opencode":
+            session = latest_opencode_session_for_cwd(cwd)
+            if session:
+                # OpenCode's session store exposes stable ses_* IDs. Some
+                # versions accept --session; if a future/older wrapper rejects
+                # it, fall back to plain opencode in the saved directory.
+                cmd = f"opencode --session {shlex.quote(session)} || opencode"
+                return cwd, ["sh", "-lc", cmd], {"tool": "opencode", "id": session}
+            return cwd, ["opencode"], {"tool": "opencode", "id": "latest"}
+
+    # Otherwise preserve the user's wrapper command for known interactive Make
+    # targets. This keeps workflows like `make ssh` and remote `make pi N=docs`
+    # intact instead of trying to reverse-engineer their long child commands.
+    for child_pid, depth in kids:
+        cwd = read_proc_cwd(child_pid)
+        if not cwd:
+            continue
+        argv = read_proc_argv(child_pid)
+        make_argv = make_restore_argv(argv)
+        if make_argv:
+            return cwd, make_argv, {}
+
+    for child_pid, depth in kids:
+        cwd = read_proc_cwd(child_pid)
+        if not cwd:
+            continue
+        argv = read_proc_argv(child_pid)
+        exe = Path(argv[0]).name if argv else ""
+        cmd = " ".join(argv)
+
+        if exe in DIRECT_RESTORE_COMMANDS and argv:
+            restore_argv = argv
+            restore_session = {}
+            best = (900 - depth, cwd)
+            continue
+
+        score = depth
+        if cwd != fallback:
+            score += 10
+        if cwd != home:
+            score += 10
+        if exe in {"nvim", "vim", "node", "python", "python3", "bash", "zsh", "fish"}:
+            score += 4
+        if " pi" in cmd:
+            score += 6
+        if score > best[0]:
+            best = (score, cwd)
+
+    return best[1], restore_argv, restore_session
+
+
+def raw_clients() -> list[dict]:
+    raw = subprocess.check_output(["hyprctl", "clients", "-j"], text=True)
+    return json.loads(raw)
+
+
+def raw_monitors() -> list[dict]:
+    try:
+        raw = subprocess.check_output(["hyprctl", "monitors", "-j"], text=True)
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
+def monitor_name_by_id() -> dict[int, str]:
+    return {m.get("id"): m.get("name") for m in raw_monitors() if m.get("name") is not None}
+
+
+def collect_windows() -> list[dict]:
+    require("hyprctl")
+    require("jq")  # not used by this script, but useful signal that the original dependency exists
+    clients = raw_clients()
+    windows = []
+    proc_children = child_map()
+    monitors = monitor_name_by_id()
+    used_sessions: dict[str, set[str]] = {}
+
+    for c in clients:
+        cls = c.get("class") or ""
+        if not cls or cls.lower() in EXCLUDED_CLASSES:
+            continue
+        pid = c.get("pid") or 0
+        cwd, cmdline, workdir, argv = proc_info(pid)
+        restore_argv: list[str] = []
+        restore_session: dict = {}
+        if cls.lower() in {"com.mitchellh.ghostty", "ghostty"}:
+            workdir, restore_argv, restore_session = terminal_child_state(pid, workdir, proc_children, used_sessions)
+        ws = c.get("workspace") or {}
+        grouped = c.get("grouped") or []
+        group_index = grouped.index(c.get("address")) if c.get("address") in grouped else 0
+        windows.append({
+            "address": c.get("address"),
+            "class": cls,
+            "initialClass": c.get("initialClass"),
+            "title": c.get("title") or "",
+            "initialTitle": c.get("initialTitle"),
+            "pid": pid,
+            "workspace": {"id": ws.get("id"), "name": ws.get("name")},
+            "monitor": c.get("monitor"),
+            "monitorName": monitors.get(c.get("monitor"), ""),
+            "grouped": grouped,
+            "groupIndex": group_index,
+            "groupSize": len(grouped),
+            "floating": c.get("floating"),
+            "fullscreen": c.get("fullscreen"),
+            "size": c.get("size"),
+            "at": c.get("at"),
+            "procCwd": cwd,
+            "procCmdline": cmdline,
+            "procArgv": argv,
+            "restoreWorkdir": workdir,
+            "restoreArgv": restore_argv,
+            "agentSession": restore_session,
+            "piSession": restore_session.get("path", "") if restore_session.get("tool") == "pi" else "",
+        })
+
+    windows.sort(key=lambda w: (w.get("workspace", {}).get("id") or 0, w.get("class") or "", w.get("title") or ""))
+    return windows
+
+
+def clean_name(name: str) -> str:
+    cleaned = "".join(ch for ch in name.strip() if ch.isalnum() or ch in "._-")
+    if not cleaned:
+        print(f"Invalid session name: {name!r}", file=sys.stderr)
+        sys.exit(1)
+    return cleaned
+
+
+def session_path(name: str | None = None) -> Path:
+    if not name or name in {"default", "last"}:
+        return SESSION_FILE
+    if name in {"autosave", "latest-autosave", "latest"}:
+        return LATEST_AUTOSAVE
+    return PROFILE_DIR / f"{clean_name(name)}.json"
+
+
+def active_session_snapshot(windows: list[dict]) -> dict:
+    active = active_window()
+    address = active.get("address") or ""
+    matched = next((w for w in windows if w.get("address") == address), {})
+    workspace = active.get("workspace") or matched.get("workspace") or {}
+    grouped = active.get("grouped") or matched.get("grouped") or []
+    group_index = grouped.index(address) if address in grouped else matched.get("groupIndex", 0)
+    return {
+        "address": address,
+        "class": active.get("class") or matched.get("class") or "",
+        "title": active.get("title") or matched.get("title") or "",
+        "workspace": {"id": workspace.get("id"), "name": workspace.get("name")},
+        "monitor": active.get("monitor"),
+        "grouped": grouped,
+        "groupIndex": group_index,
+        "restoreKey": restore_key(matched) if matched else "",
+    }
+
+
+def write_session(path: Path, *, quiet: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    windows = collect_windows()
+    data = {
+        "savedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "host": os.environ.get("HOSTNAME", ""),
+        "activeWindow": active_session_snapshot(windows),
+        "windows": windows,
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+    if not quiet:
+        count = len(data["windows"])
+        print(f"Saved {count} windows to {path}")
+        notify("Omarchy session saved", f"{count} windows saved")
+
+
+def cleanup_autosaves(keep: int = AUTOSAVE_KEEP) -> None:
+    if not AUTOSAVE_DIR.exists():
+        return
+    snapshots = sorted(p for p in AUTOSAVE_DIR.glob("*.json") if p.name != "latest.json")
+    for old in snapshots[:-keep]:
+        try:
+            old.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def autosave_once(*, quiet: bool = False) -> Path:
+    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+    path = AUTOSAVE_DIR / f"{timestamp}.json"
+    write_session(path, quiet=quiet)
+    try:
+        tmp_latest = LATEST_AUTOSAVE.with_suffix(".tmp")
+        if tmp_latest.exists() or tmp_latest.is_symlink():
+            tmp_latest.unlink()
+        tmp_latest.symlink_to(path.name)
+        tmp_latest.replace(LATEST_AUTOSAVE)
+    except Exception:
+        # Fall back to a real file if symlinks/replace fail for any reason.
+        shutil.copy2(path, LATEST_AUTOSAVE)
+    cleanup_autosaves()
+    return path
+
+
+def autosave_loop() -> None:
+    lock = STATE_DIR / "autosave-loop.pid"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if lock.exists():
+        try:
+            old_pid = int(lock.read_text().strip())
+            os.kill(old_pid, 0)
+            if is_autosave_loop_pid(old_pid):
+                print(f"Autosave loop already running as PID {old_pid}")
+                return
+            print(f"Removing stale autosave pid file for PID {old_pid} (not autosave-loop)")
+            lock.unlink()
+        except Exception:
+            try:
+                lock.unlink()
+            except FileNotFoundError:
+                pass
+    lock.write_text(str(os.getpid()))
+    try:
+        while True:
+            path = autosave_once(quiet=True)
+            print(f"Autosaved session to {path}", flush=True)
+            time.sleep(3600)
+    finally:
+        try:
+            if lock.read_text().strip() == str(os.getpid()):
+                lock.unlink()
+        except Exception:
+            pass
+
+
+def list_autosaves() -> None:
+    if not AUTOSAVE_DIR.exists():
+        print(f"No autosaves found at {AUTOSAVE_DIR}")
+        return
+    for path in sorted(AUTOSAVE_DIR.glob("*.json")):
+        marker = " -> latest" if path.resolve() == LATEST_AUTOSAVE.resolve() else ""
+        if path.name == "latest.json":
+            continue
+        print(f"{path}{marker}")
+
+
+def load_session(path: Path) -> dict:
+    if not path.exists():
+        print(f"No saved session found at {path}", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(path.read_text())
+
+
+def lc_class(win: dict) -> str:
+    return (win.get("class") or "").lower()
+
+
+def browser_app_args(win: dict) -> tuple[str, list[str]]:
+    argv = win.get("procArgv") or []
+    if not argv and win.get("procCmdline"):
+        try:
+            argv = shlex.split(win.get("procCmdline") or "")
+        except ValueError:
+            argv = []
+
+    url = ""
+    flags: list[str] = []
+    keep_prefixes = ("--profile-directory=", "--user-data-dir=", "--class=", "--name=")
+    keep_words = {"--profile-directory", "--user-data-dir", "--class", "--name"}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("--app="):
+            url = arg.split("=", 1)[1]
+        elif arg == "--app" and i + 1 < len(argv):
+            url = argv[i + 1]
+            i += 1
+        elif arg.startswith(keep_prefixes):
+            flags.append(arg)
+        elif arg in keep_words and i + 1 < len(argv):
+            flags.extend([arg, argv[i + 1]])
+            i += 1
+        i += 1
+    return url, flags
+
+
+def is_webapp(win: dict) -> bool:
+    return bool(browser_app_args(win)[0])
+
+
+def is_singleton(win: dict) -> bool:
+    return lc_class(win) in SINGLETON_CLASSES and not is_webapp(win)
+
+
+def workspace_spec(win: dict) -> str:
+    ws = win.get("workspace") or {}
+    name = ws.get("name") or ""
+    wid = ws.get("id")
+    if name.startswith("special:"):
+        return name
+    if isinstance(wid, int) and wid < 0:
+        return name or "special:scratchpad"
+    return str(wid or 1)
+
+
+def is_special_workspace(win: dict) -> bool:
+    return workspace_spec(win).startswith("special:")
+
+
+def restore_key(win: dict) -> str:
+    cls = lc_class(win)
+    webapp_url, webapp_flags = browser_app_args(win)
+    ws = workspace_spec(win)
+    if webapp_url:
+        return f"ws:{ws}|webapp:{webapp_url}|flags:{' '.join(webapp_flags)}"
+    if cls in SINGLETON_CLASSES:
+        return f"app:{cls}"
+    workdir = win.get("restoreWorkdir") or ""
+    if cls in {"com.mitchellh.ghostty", "ghostty"}:
+        agent = win.get("agentSession") or {}
+        if agent.get("tool") and agent.get("id") and agent.get("id") != "latest":
+            return f"ws:{ws}|class:{cls}|agent:{agent.get('tool')}:{agent.get('id')}"
+        return f"ws:{ws}|class:{cls}|dir:{workdir}"
+    return f"ws:{ws}|class:{cls}"
+
+
+def uwsm_cmd(cmd: list[str]) -> list[str]:
+    if shutil.which("uwsm"):
+        return ["uwsm", "app", "--", *cmd]
+    return cmd
+
+
+def hypr(*args: str) -> None:
+    subprocess.run(["hyprctl", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def hypr_exec_on_workspace(cmd: list[str], ws: str) -> None:
+    # Hyprland exec rules launch on the target workspace without switching your
+    # current focus there. This avoids restore yanking you around.
+    rule = f"[workspace {ws} silent] " if ws else ""
+    hypr("dispatch", "exec", rule + shlex.join(uwsm_cmd(cmd)))
+
+
+def monitor_target(win: dict) -> str:
+    name = win.get("monitorName") or ""
+    if name:
+        return str(name)
+    monitor = win.get("monitor")
+    if isinstance(monitor, int):
+        return str(monitor)
+    return ""
+
+
+def restore_workspace_monitors(targets: list[dict]) -> int:
+    available_names = {m.get("name") for m in raw_monitors() if m.get("name")}
+    moved: set[tuple[str, str]] = set()
+    for win in targets:
+        ws = workspace_spec(win)
+        if not ws or ws.startswith("special:"):
+            continue
+        monitor = monitor_target(win)
+        if not monitor:
+            continue
+        if available_names and not monitor.isdigit() and monitor not in available_names:
+            continue
+        key = (ws, monitor)
+        if key in moved:
+            continue
+        hypr("dispatch", "moveworkspacetomonitor", f"{ws} {monitor}")
+        moved.add(key)
+    return len(moved)
+
+
+def find_new_window(target: dict, before_addresses: set[str], timeout: float = 6.0) -> dict | None:
+    deadline = time.time() + timeout
+    target_key = restore_key(target)
+    while time.time() < deadline:
+        try:
+            for win in collect_windows():
+                if (win.get("address") or "") in before_addresses:
+                    continue
+                if restore_key(win) == target_key or lc_class(win) == lc_class(target):
+                    return win
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return None
+
+
+def apply_saved_state(target: dict, before_addresses: set[str]) -> str:
+    win = find_new_window(target, before_addresses)
+    if not win:
+        return ""
+    address = win.get("address") or ""
+    if not address:
+        return ""
+    before_addresses.add(address)
+
+    ws = workspace_spec(target)
+    if ws.startswith("special:"):
+        hypr("dispatch", "movetoworkspacesilent", f"{ws},address:{address}")
+        return address
+
+    # Best-effort: geometry restore is useful mostly for floating windows. Tiled
+    # windows are intentionally left to Hyprland's layout. Avoid focuswindow here
+    # so restore does not steal focus.
+    if target.get("floating"):
+        hypr("dispatch", "setfloating", f"address:{address}")
+        size = target.get("size") or []
+        at = target.get("at") or []
+        if len(size) == 2:
+            hypr("dispatch", "resizewindowpixel", f"exact {size[0]} {size[1]},address:{address}")
+        if len(at) == 2:
+            hypr("dispatch", "movewindowpixel", f"exact {at[0]} {at[1]},address:{address}")
+    return address
+
+
+def active_window() -> dict:
+    try:
+        raw = subprocess.check_output(["hyprctl", "activewindow", "-j"], text=True)
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def window_group(address: str) -> list[str]:
+    try:
+        for win in raw_clients():
+            if win.get("address") == address:
+                return win.get("grouped") or []
+    except Exception:
+        pass
+    return []
+
+
+def addresses_same_group(addresses: list[str]) -> bool:
+    wanted = set(addresses)
+    if len(wanted) < 2:
+        return True
+    for address in wanted:
+        grouped = set(window_group(address))
+        if wanted.issubset(grouped):
+            return True
+    return False
+
+
+def assign_current_addresses(targets: list[dict]) -> dict[str, str]:
+    """Map saved Hyprland addresses to current ones after restore.
+
+    Addresses change after reboot, so this uses stable restore keys and then
+    falls back to workspace/class/title matching. It is only used for best-effort
+    Hyprland group/tab restoration.
+    """
+    current = collect_windows()
+    used: set[str] = set()
+    assigned: dict[str, str] = {}
+
+    current_by_address = {w.get("address"): w for w in current if w.get("address")}
+    for target in targets:
+        saved_address = target.get("address") or ""
+        if saved_address and saved_address in current_by_address and saved_address not in used:
+            assigned[saved_address] = saved_address
+            used.add(saved_address)
+
+    def pick(target: dict, candidates: list[dict]) -> str:
+        title = target.get("title") or ""
+        for candidate in candidates:
+            addr = candidate.get("address") or ""
+            if addr not in used and (candidate.get("title") or "") == title:
+                return addr
+        for candidate in candidates:
+            addr = candidate.get("address") or ""
+            if addr not in used:
+                return addr
+        return ""
+
+    for target in targets:
+        saved_address = target.get("address") or ""
+        if not saved_address or saved_address in assigned:
+            continue
+        key = restore_key(target)
+        addr = pick(target, [w for w in current if restore_key(w) == key])
+        if not addr:
+            ws = workspace_spec(target)
+            cls = lc_class(target)
+            addr = pick(target, [w for w in current if workspace_spec(w) == ws and lc_class(w) == cls])
+        if addr:
+            assigned[saved_address] = addr
+            used.add(addr)
+
+    return assigned
+
+
+def group_addresses(addresses: list[str]) -> bool:
+    if len(addresses) < 2 or addresses_same_group(addresses):
+        return True
+
+    first = addresses[0]
+    if len(window_group(first)) < 2:
+        hypr("dispatch", "focuswindow", f"address:{first}")
+        hypr("dispatch", "togglegroup")
+        time.sleep(0.15)
+
+    # Hyprland's moveintogroup is directional. Restored windows are normally on
+    # the same workspace, so try all directions and stop as soon as the target
+    # joins the first window's group. This is best-effort and leaves focus
+    # restored by restore_groups().
+    for address in addresses[1:]:
+        if addresses_same_group([first, address]):
+            continue
+        hypr("dispatch", "focuswindow", f"address:{address}")
+        for direction in ("l", "r", "u", "d"):
+            hypr("dispatch", "moveintogroup", direction)
+            time.sleep(0.15)
+            if addresses_same_group([first, address]):
+                break
+    return addresses_same_group(addresses)
+
+
+def restore_groups(targets: list[dict]) -> tuple[int, dict[str, str]]:
+    assigned = assign_current_addresses(targets)
+    grouped_targets: dict[tuple[str, ...], list[str]] = {}
+    for win in targets:
+        grouped = win.get("grouped") or []
+        if len(grouped) > 1:
+            grouped_targets.setdefault(tuple(grouped), grouped)
+    if not grouped_targets:
+        return 0, assigned
+
+    restored = 0
+    for saved_addresses in grouped_targets.values():
+        current_addresses = [assigned[a] for a in saved_addresses if a in assigned]
+        # Deduplicate while preserving saved group/tab order.
+        current_addresses = list(dict.fromkeys(current_addresses))
+        if len(current_addresses) < 2 or addresses_same_group(current_addresses):
+            continue
+        if group_addresses(current_addresses):
+            restored += 1
+
+    return restored, assigned
+
+
+def workspace_from_snapshot(snapshot: dict) -> str:
+    ws = snapshot.get("workspace") or {}
+    name = ws.get("name") or ""
+    wid = ws.get("id")
+    if name.startswith("special:"):
+        return name
+    if isinstance(wid, int) and wid < 0:
+        return name or "special:scratchpad"
+    return str(wid or "")
+
+
+def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str], fallback_active: dict) -> bool:
+    active = data.get("activeWindow") or {}
+    if active:
+        saved_address = active.get("address") or ""
+        current_address = assigned.get(saved_address, "")
+        if not current_address and saved_address:
+            try:
+                live_addresses = {w.get("address") for w in raw_clients()}
+                if saved_address in live_addresses:
+                    current_address = saved_address
+            except Exception:
+                pass
+        if current_address:
+            hypr("dispatch", "focuswindow", f"address:{current_address}")
+            return True
+
+        active_key = active.get("restoreKey") or ""
+        if active_key:
+            for win in collect_windows():
+                if restore_key(win) == active_key:
+                    address = win.get("address") or ""
+                    if address:
+                        hypr("dispatch", "focuswindow", f"address:{address}")
+                        return True
+
+        ws = workspace_from_snapshot(active)
+        if ws:
+            hypr("dispatch", "workspace", ws)
+            return True
+
+    # Older session files did not record active focus. Preserve the user's
+    # pre-restore focus in that case so restore does not yank them around.
+    fallback_address = fallback_active.get("address") or ""
+    if fallback_address:
+        hypr("dispatch", "focuswindow", f"address:{fallback_address}")
+        return True
+    fallback_ws = workspace_from_snapshot(fallback_active)
+    if fallback_ws:
+        hypr("dispatch", "workspace", fallback_ws)
+        return True
+    return False
+
+
+def launch(win: dict) -> bool:
+    cls = lc_class(win)
+    workdir = win.get("restoreWorkdir") or ""
+    webapp_url, webapp_flags = browser_app_args(win)
+    cmd: list[str] | None = None
+
+    if webapp_url and shutil.which("omarchy-launch-webapp"):
+        cmd = ["omarchy-launch-webapp", webapp_url, *webapp_flags]
+    elif cls in {"com.mitchellh.ghostty", "ghostty"}:
+        restore_argv = win.get("restoreArgv") or []
+        cmd = ["ghostty"]
+        if workdir and Path(workdir).is_dir():
+            cmd.append(f"--working-directory={workdir}")
+        if restore_argv:
+            cmd.extend(["-e", *restore_argv])
+    elif cls in {"chromium", "chromium-browser"}:
+        cmd = ["chromium"]
+    elif cls in {"brave-browser", "brave"}:
+        cmd = ["brave"]
+    elif cls in {"google-chrome", "google-chrome-stable"}:
+        cmd = ["google-chrome-stable"]
+    elif cls in {"firefox", "firefoxdeveloperedition"}:
+        cmd = ["firefox"]
+    elif cls == "obsidian":
+        cmd = ["obsidian"]
+    elif cls == "slack":
+        cmd = ["slack"]
+    elif cls == "discord":
+        cmd = ["discord"]
+    elif cls in {"signal", "signal-desktop"}:
+        cmd = ["signal-desktop"]
+    elif cls in {"org.gnome.nautilus", "nautilus"}:
+        cmd = ["nautilus", "--new-window"]
+    elif cls == "thunderbird":
+        cmd = ["thunderbird"]
+    elif cls == "keepassxc":
+        cmd = ["keepassxc"]
+    elif cls in {"code", "code-url-handler", "visual-studio-code"}:
+        cmd = ["code", workdir] if workdir and Path(workdir).is_dir() else ["code"]
+
+    if not cmd:
+        print(f"Skipping unknown app class: {win.get('class')} — {win.get('title')}", file=sys.stderr)
+        return False
+    if not shutil.which(cmd[0]):
+        print(f"Skipping missing command for {win.get('class')}: {cmd[0]}", file=sys.stderr)
+        return False
+
+    ws = workspace_spec(win)
+    hypr_exec_on_workspace(cmd, ws)
+    return True
+
+
+def write_last_restore(source: Path, launched_windows: list[dict]) -> None:
+    LAST_RESTORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "restoredAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": str(source),
+        "launched": launched_windows,
+    }
+    tmp = LAST_RESTORE_FILE.with_suffix(LAST_RESTORE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(LAST_RESTORE_FILE)
+
+
+def hard_undo() -> None:
+    if not LAST_RESTORE_FILE.exists():
+        print(f"No restore launch record found at {LAST_RESTORE_FILE}")
+        return
+    data = load_session(LAST_RESTORE_FILE)
+    launched = data.get("launched") or []
+    if not launched:
+        print("Last restore did not launch any windows; nothing to close")
+        return
+    live_addresses = {w.get("address") for w in raw_clients()}
+    closed = 0
+    missing = 0
+    for item in launched:
+        address = item.get("address") or ""
+        if not address or address not in live_addresses:
+            missing += 1
+            continue
+        hypr("dispatch", "closewindow", f"address:{address}")
+        closed += 1
+        time.sleep(0.1)
+    print(f"Hard undo closed {closed} windows from last restore; missing/already closed {missing}")
+    notify("Omarchy hard undo", f"Closed {closed}; missing {missing}")
+
+
+def restore(path: Path, *, save_undo: bool = True) -> None:
+    data = load_session(path)
+    targets = [w for w in data.get("windows", []) if workspace_spec(w) != "0"]
+
+    if save_undo:
+        write_session(UNDO_FILE, quiet=True)
+        print(f"Stored pre-restore state at {UNDO_FILE}")
+
+    fallback_active = active_window()
+    current_windows = collect_windows()
+    before_addresses = {w.get("address") or "" for w in current_windows}
+    current_counts = Counter(restore_key(w) for w in current_windows)
+    monitors_restored = restore_workspace_monitors(targets)
+    launched = 0
+    skipped_open = 0
+    skipped_unknown = 0
+    groups_restored = 0
+    launched_windows: list[dict] = []
+
+    for win in targets:
+        key = restore_key(win)
+        if current_counts[key] > 0:
+            if not is_singleton(win):
+                current_counts[key] -= 1
+            skipped_open += 1
+            continue
+        if launch(win):
+            launched += 1
+            address = apply_saved_state(win, before_addresses)
+            if address:
+                launched_windows.append({
+                    "address": address,
+                    "class": win.get("class"),
+                    "title": win.get("title"),
+                    "workspace": workspace_spec(win),
+                    "restoreKey": restore_key(win),
+                })
+            if is_singleton(win) or is_webapp(win):
+                current_counts[key] += 1
+            time.sleep(0.35)
+        else:
+            skipped_unknown += 1
+
+    groups_restored, assigned = restore_groups(targets)
+    focus_restored = restore_saved_focus(data, targets, assigned, fallback_active)
+    focus_note = ", focus restored" if focus_restored else ""
+    write_last_restore(path, launched_windows)
+    monitor_note = f", monitor placements {monitors_restored}" if monitors_restored else ""
+    print(f"Restore checked {len(targets)} saved windows: launched {launched}, already open {skipped_open}, skipped {skipped_unknown}, groups restored {groups_restored}{monitor_note}{focus_note}")
+    notify("Omarchy session restore", f"Launched {launched}; already open {skipped_open}; groups {groups_restored}")
+
+
+def session_choices() -> list[tuple[str, Path]]:
+    choices: list[tuple[str, Path]] = [("default", SESSION_FILE)]
+    if PROFILE_DIR.exists():
+        for path in sorted(PROFILE_DIR.glob("*.json")):
+            choices.append((f"profile: {path.stem}", path))
+    if LATEST_AUTOSAVE.exists() or LATEST_AUTOSAVE.is_symlink():
+        choices.append(("autosave: latest", LATEST_AUTOSAVE))
+    if AUTOSAVE_DIR.exists():
+        autosaves = sorted((p for p in AUTOSAVE_DIR.glob("*.json") if p.name != "latest.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in autosaves[:20]:
+            choices.append((f"autosave: {path.stem}", path))
+    return choices
+
+
+def list_profiles() -> None:
+    for label, path in session_choices():
+        print(f"{label}\t{path}")
+
+
+def run_menu(labels: list[str], prompt: str) -> str:
+    menu_cmds = [
+        ["walker", "--dmenu", "--exit", "--placeholder", prompt],
+        ["wofi", "--dmenu", "--prompt", prompt],
+        ["fuzzel", "--dmenu", "--prompt", f"{prompt}: "],
+        ["rofi", "-dmenu", "-p", prompt],
+    ]
+    for cmd in menu_cmds:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            result = subprocess.run(cmd, input="\n".join(labels) + "\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except Exception:
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[-1]
+        if result.returncode != 0:
+            return ""
+
+    if sys.stdin.isatty():
+        for i, label in enumerate(labels, 1):
+            print(f"{i:2d}. {label}")
+        answer = input(f"{prompt} [1-{len(labels)}]: ").strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(labels):
+            return labels[int(answer) - 1]
+    else:
+        for i, label in enumerate(labels, 1):
+            print(f"{i}\t{label}")
+    return ""
+
+
+def pick_session(action: str = "restore") -> None:
+    choices = session_choices()
+    if not choices:
+        print("No sessions found", file=sys.stderr)
+        sys.exit(1)
+    labels = [label for label, _ in choices]
+    picked = run_menu(labels, f"ws {action}")
+    if not picked:
+        print("No session selected", file=sys.stderr)
+        sys.exit(1)
+    mapping = dict(choices)
+    path = mapping.get(picked)
+    if not path:
+        print(f"Unknown selection: {picked}", file=sys.stderr)
+        sys.exit(1)
+
+    if action in {"restore", "r", "start"}:
+        restore(path, save_undo=True)
+    elif action in {"list", "l", "show"}:
+        list_session(path)
+    elif action in {"path", "p"}:
+        print(path)
+    else:
+        print(f"Unsupported pick action: {action}", file=sys.stderr)
+        sys.exit(1)
+
+
+def count_session_windows(path: Path) -> str:
+    if not path.exists() and not path.is_symlink():
+        return "missing"
+    try:
+        data = load_session(path)
+        return str(len(data.get("windows", [])))
+    except Exception:
+        return "unreadable"
+
+
+def file_age(path: Path) -> str:
+    if not path.exists() and not path.is_symlink():
+        return "missing"
+    try:
+        seconds = max(0, int(time.time() - path.stat().st_mtime))
+    except Exception:
+        return "unknown"
+    if seconds < 90:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 90:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
+def is_autosave_loop_pid(pid: int) -> bool:
+    argv = read_proc_argv(pid)
+    joined = " ".join(argv)
+    return "omarchy-session" in joined and "autosave-loop" in joined
+
+
+def autosave_loop_status() -> str:
+    pid_file = STATE_DIR / "autosave-loop.pid"
+    if not pid_file.exists():
+        return "not running (no pid file)"
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, 0)
+        if is_autosave_loop_pid(pid):
+            return f"running pid {pid}"
+        return f"stale pid file ({pid_file}; pid {pid} is not autosave-loop)"
+    except Exception:
+        return f"stale pid file ({pid_file})"
+
+
+def modmask_label(modmask: int) -> str:
+    parts: list[str] = []
+    for bit, name in ((64, "Super"), (1, "Shift"), (4, "Ctrl"), (8, "Alt")):
+        if modmask & bit:
+            parts.append(name)
+    return "+".join(parts)
+
+
+def session_shortcuts() -> list[str]:
+    try:
+        raw = subprocess.check_output(["hyprctl", "binds", "-j"], text=True, stderr=subprocess.DEVNULL)
+        binds = json.loads(raw)
+    except Exception:
+        binds = []
+
+    rows: list[tuple[str, str, str]] = []
+    for bind in binds:
+        arg = bind.get("arg") or ""
+        if not re.search(r"(^|\s|/)(omarchy-session|ws|restore-workspace)(\s|$)", arg):
+            continue
+        key = bind.get("key") or (f"code:{bind.get('keycode')}" if bind.get("keycode") else "")
+        combo = "+".join(part for part in (modmask_label(int(bind.get("modmask") or 0)), key) if part)
+        description = bind.get("description") or "workspace session"
+        rows.append((combo, description, arg))
+
+    if not rows:
+        return [
+            "  Super+Shift+Alt+R  Save current workspace -> ws s",
+            "  Super+Shift+R      Restore saved workspace -> ws r",
+        ]
+
+    width = max(len(combo) for combo, _, _ in rows)
+    return [f"  {combo:<{width}}  {description} -> {arg}" for combo, description, arg in rows]
+
+
+def shortcuts_help_block() -> str:
+    return "\n".join(session_shortcuts())
+
+
+def health_status() -> None:
+    install = Path(__file__)
+    try:
+        install = install.resolve()
+    except Exception:
+        pass
+    print("Omarchy session status")
+    print(f"  install: {install}")
+    print(f"  state:   {STATE_DIR}")
+    print(f"  autosave loop: {autosave_loop_status()}")
+    print(f"  default save:  {SESSION_FILE} ({count_session_windows(SESSION_FILE)} windows, {file_age(SESSION_FILE)})")
+    print(f"  latest autosave: {LATEST_AUTOSAVE} ({count_session_windows(LATEST_AUTOSAVE)} windows, {file_age(LATEST_AUTOSAVE)})")
+    print(f"  undo snapshot: {UNDO_FILE} ({count_session_windows(UNDO_FILE)} windows, {file_age(UNDO_FILE)})")
+    if LAST_RESTORE_FILE.exists():
+        try:
+            data = load_session(LAST_RESTORE_FILE)
+            launched = len(data.get("launched") or [])
+            print(f"  last restore: {launched} launched windows, {file_age(LAST_RESTORE_FILE)}")
+        except Exception:
+            print(f"  last restore: unreadable ({LAST_RESTORE_FILE})")
+    else:
+        print("  last restore: missing")
+    print("  shortcuts:")
+    print(shortcuts_help_block())
+    print("  commands: ws s, ws r, ws pick, ws a, ws as, ws u, ws undo-hard, ws status")
+
+
+def list_session(path: Path = SESSION_FILE) -> None:
+    if not path.exists():
+        print(f"No saved session found at {path}")
+        return
+    data = load_session(path)
+    active = data.get("activeWindow") or {}
+    active_line = ""
+    if active:
+        active_line = f"Active: workspace {workspace_from_snapshot(active)} — {active.get('class')} — {active.get('title')}\n"
+    print(f"Saved: {data.get('savedAt')}\nFile: {path}\n{active_line}")
+    for w in data.get("windows", []):
+        ws = workspace_spec(w)
+        webapp_url, _ = browser_app_args(w)
+        suffix = f" [{w.get('restoreWorkdir')}]" if w.get("restoreWorkdir") else ""
+        if w.get("restoreArgv"):
+            suffix += f" [restore: {shlex.join(w.get('restoreArgv') or [])}]"
+        if w.get("agentSession"):
+            agent = w.get("agentSession") or {}
+            suffix += f" [session: {agent.get('tool')} {agent.get('id')}]"
+        if (w.get("groupSize") or 0) > 1:
+            suffix += f" [group tab {int(w.get('groupIndex') or 0) + 1}/{w.get('groupSize')}]"
+        if w.get("monitorName"):
+            suffix += f" [monitor: {w.get('monitorName')}]"
+        if webapp_url:
+            suffix += f" [webapp: {webapp_url}]"
+        print(f"workspace {ws}: {w.get('class')} — {w.get('title')}{suffix}")
+
+
+def usage() -> None:
+    prog = Path(sys.argv[0]).name
+    print(f"""Usage: {prog} <command> [name]
+
+Short commands:
+  s [name]    save
+  r [name]    restore only missing windows
+  l [name]    list
+  p           profiles/named setups
+  pick        pick a profile/autosave and restore it
+  a           autosave now
+  as          list autosaves
+  u           undo/restore pre-restore state
+  uh          hard undo: close windows launched by the last restore
+  st          status/health
+
+Full commands still work:
+  save [name], restore [name], list [name], profiles, pick [restore|list|path], autosave, autosaves, undo, undo-hard, status, path [name]
+
+Current shortcuts:
+{shortcuts_help_block()}
+
+Files:
+  default:   {SESSION_FILE}
+  named:     {PROFILE_DIR}
+  autosaves: {AUTOSAVE_DIR}  (keeps latest {AUTOSAVE_KEEP})
+""")
+
+
+def main() -> None:
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    aliases = {
+        "s": "save",
+        "r": "restore",
+        "l": "list",
+        "p": "profiles",
+        "pk": "pick",
+        "a": "autosave",
+        "al": "autosave-loop",
+        "as": "autosaves",
+        "u": "undo",
+        "uh": "undo-hard",
+        "st": "status",
+    }
+    cmd = aliases.get(cmd, cmd)
+    name = sys.argv[2] if len(sys.argv) > 2 else None
+    if cmd == "save":
+        write_session(session_path(name))
+    elif cmd == "autosave":
+        path = autosave_once()
+        print(f"Autosave: {path}")
+    elif cmd == "autosave-loop":
+        autosave_loop()
+    elif cmd in {"restore", "start"}:
+        restore(session_path(name), save_undo=True)
+    elif cmd == "undo":
+        restore(UNDO_FILE, save_undo=False)
+    elif cmd in {"undo-hard", "hard-undo"}:
+        hard_undo()
+    elif cmd == "status":
+        health_status()
+    elif cmd in {"list", "show"}:
+        list_session(session_path(name))
+    elif cmd == "list-undo":
+        list_session(UNDO_FILE)
+    elif cmd in {"profiles", "setups"}:
+        list_profiles()
+    elif cmd == "pick":
+        pick_session(sys.argv[2] if len(sys.argv) > 2 else "restore")
+    elif cmd in {"autosaves", "list-autosaves"}:
+        list_autosaves()
+    elif cmd == "path":
+        print(session_path(name))
+    else:
+        usage()
+
+
+if __name__ == "__main__":
+    main()
