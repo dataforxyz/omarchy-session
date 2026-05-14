@@ -136,7 +136,10 @@ class RestoreCommandTests(unittest.TestCase):
                     "restoreArgv": ["pi"],
                 })
                 self.assertEqual(reason, "")
-                self.assertEqual(cmd, ["alacritty", f"--working-directory={workdir}", "-e", "pi"])
+                self.assertEqual(cmd, [
+                    "alacritty", f"--working-directory={workdir}",
+                    "-e", "bash", "-lc", '"$@"', "omarchy-session-restore", "pi",
+                ])
 
                 cmd, reason = mod.launch_command({"class": "org.keepassxc.KeePassXC"})
                 self.assertEqual(reason, "")
@@ -159,7 +162,30 @@ class RestoreCommandTests(unittest.TestCase):
             with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
                 cmd, reason = mod.launch_command(win)
                 self.assertEqual(reason, "")
-                self.assertEqual(cmd, ["alacritty", f"--working-directory={workdir}", "-e", "pi", "--session", str(session)])
+                self.assertEqual(cmd, [
+                    "alacritty", f"--working-directory={workdir}",
+                    "-e", "bash", "-lc", '"$@"', "omarchy-session-restore",
+                    "pi", "--session", str(session),
+                ])
+
+    def test_legacy_pi_session_cwd_replaces_home_workdir(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            home.mkdir()
+            project.mkdir()
+            session = Path(tmp) / "session.jsonl"
+            session.write_text(json.dumps({"cwd": str(project)}) + "\n")
+            win = {
+                "class": "Alacritty",
+                "title": "pi - project:🚧",
+                "restoreWorkdir": str(home),
+                "restoreArgv": [],
+            }
+            with mock.patch.object(mod, "legacy_pi_session_candidates", lambda win: [str(session)]):
+                mod.enrich_legacy_terminal_targets([win])
+            self.assertEqual(win["restoreWorkdir"], str(project))
 
     def test_chromium_webapp_recovers_single_string_argv_and_class_url(self):
         mod = load_module()

@@ -178,6 +178,17 @@ def pi_title_label(title: str) -> str:
     return label
 
 
+def pi_session_cwd(session: str) -> str:
+    try:
+        with Path(session).open(errors="ignore") as handle:
+            first = handle.readline()
+        meta = json.loads(first)
+        cwd = meta.get("cwd") or (meta.get("payload") or {}).get("cwd") or ""
+        return cwd if cwd and Path(cwd).is_dir() else ""
+    except Exception:
+        return ""
+
+
 def pi_sessions_matching_label(label: str) -> list[str]:
     if not label or not PI_SESSION_ROOT.exists():
         return []
@@ -1032,6 +1043,9 @@ def enrich_legacy_terminal_targets(targets: list[dict]) -> None:
             win["restoreArgv"] = ["pi", "--session", session]
             win["agentSession"] = {"tool": "pi", "id": session, "path": session, "match": "legacy-title-cwd"}
             win["piSession"] = session
+            session_cwd = pi_session_cwd(session)
+            if session_cwd:
+                win["restoreWorkdir"] = session_cwd
 
 
 def terminal_restore_argv(win: dict) -> list[str]:
@@ -1058,6 +1072,18 @@ def terminal_restore_argv(win: dict) -> list[str]:
     return []
 
 
+def terminal_exec_argv(restore_argv: list[str]) -> list[str]:
+    if not restore_argv:
+        return []
+
+    # Omarchy's Super+Return binding asks `omarchy-cmd-terminal-cwd` for the cwd
+    # of the active terminal. That helper intentionally trusts only a direct
+    # shell child of the terminal. If we launch `alacritty -e pi --session ...`,
+    # the terminal's direct child is `pi`, so Super+Return falls back to $HOME.
+    # Keep a shell as the direct child and run the restored command underneath it.
+    return ["bash", "-lc", '"$@"', "omarchy-session-restore", *restore_argv]
+
+
 def launch_command(win: dict) -> tuple[list[str] | None, str]:
     cls = lc_class(win)
     workdir = win.get("restoreWorkdir") or ""
@@ -1072,14 +1098,14 @@ def launch_command(win: dict) -> tuple[list[str] | None, str]:
         if workdir and Path(workdir).is_dir():
             cmd.append(f"--working-directory={workdir}")
         if restore_argv:
-            cmd.extend(["-e", *restore_argv])
+            cmd.extend(["-e", *terminal_exec_argv(restore_argv)])
     elif cls == "alacritty":
         restore_argv = terminal_restore_argv(win)
         cmd = ["alacritty"]
         if workdir and Path(workdir).is_dir():
             cmd.append(f"--working-directory={workdir}")
         if restore_argv:
-            cmd.extend(["-e", *restore_argv])
+            cmd.extend(["-e", *terminal_exec_argv(restore_argv)])
     elif cls in {"chromium", "chromium-browser"}:
         cmd = ["chromium"]
     elif cls in {"brave-browser", "brave"}:
