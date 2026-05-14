@@ -1,6 +1,6 @@
 # omarchy-session
 
-A small Hyprland/Ghostty workspace session helper for Omarchy-style desktops.
+A small Hyprland terminal workspace session helper for Omarchy-style desktops.
 It saves open windows, workspaces, scratchpad placement, grouped tabs, monitor
 placement, and best-effort restore commands for terminal workflows.
 
@@ -67,7 +67,7 @@ redact them before sharing bug reports, screenshots, test fixtures, or commits.
 - Linux with Hyprland
 - Python 3
 - `hyprctl`
-- Ghostty for the most complete terminal restore behavior
+- Ghostty or Alacritty for the most complete terminal restore behavior
 - Optional picker: Walker, wofi, fuzzel, or rofi
 
 See [`docs/workspace-session-restore.md`](docs/workspace-session-restore.md) for

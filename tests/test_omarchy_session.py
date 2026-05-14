@@ -123,6 +123,58 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(calls, [Path("/tmp/demo.json")] * 4)
 
 
+class RestoreCommandTests(unittest.TestCase):
+    def test_alacritty_and_keepassxc_restore_commands(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
+                cmd, reason = mod.launch_command({
+                    "class": "Alacritty",
+                    "workspace": {"id": 2, "name": "2"},
+                    "restoreWorkdir": str(workdir),
+                    "restoreArgv": ["pi"],
+                })
+                self.assertEqual(reason, "")
+                self.assertEqual(cmd, ["alacritty", f"--working-directory={workdir}", "-e", "pi"])
+
+                cmd, reason = mod.launch_command({"class": "org.keepassxc.KeePassXC"})
+                self.assertEqual(reason, "")
+                self.assertEqual(cmd, ["keepassxc"])
+
+    def test_legacy_alacritty_pi_title_reopens_pi(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            session = workdir / "session.jsonl"
+            session.write_text("{}\n")
+            with mock.patch.object(mod, "legacy_pi_session_candidates", lambda win: [str(session)]):
+                win = {
+                    "class": "Alacritty",
+                    "title": "pi - demo:🚧",
+                    "restoreWorkdir": str(workdir),
+                    "restoreArgv": [],
+                }
+                mod.enrich_legacy_terminal_targets([win])
+            with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
+                cmd, reason = mod.launch_command(win)
+                self.assertEqual(reason, "")
+                self.assertEqual(cmd, ["alacritty", f"--working-directory={workdir}", "-e", "pi", "--session", str(session)])
+
+    def test_chromium_webapp_recovers_single_string_argv_and_class_url(self):
+        mod = load_module()
+        win = {
+            "class": "chrome-perplexity.ai__-Default",
+            "procArgv": [
+                "/usr/lib/chromium/chromium --app=https://music.youtube.com/ --profile-directory=Profile 3"
+            ],
+        }
+        self.assertEqual(
+            mod.browser_app_args(win),
+            ("https://perplexity.ai/", ["--profile-directory=Default"]),
+        )
+
+
 class InstallerSafetyTests(unittest.TestCase):
     def test_installer_refuses_unrelated_alias_unless_forced(self):
         with tempfile.TemporaryDirectory() as tmp:

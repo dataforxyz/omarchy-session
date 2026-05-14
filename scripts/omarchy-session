@@ -12,6 +12,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlparse
 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy-session"
 SESSION_FILE = STATE_DIR / "last-session.json"
@@ -32,10 +33,12 @@ SINGLETON_CLASSES = {
     "chromium", "chromium-browser", "brave-browser", "brave",
     "google-chrome", "google-chrome-stable", "firefox", "firefoxdeveloperedition",
     "slack", "discord", "signal", "signal-desktop", "obsidian", "thunderbird", "keepassxc",
+    "org.keepassxc.keepassxc",
 }
+TERMINAL_CLASSES = {"com.mitchellh.ghostty", "ghostty", "alacritty"}
 REQUIRED_COMMANDS = ("hyprctl",)
 OPTIONAL_COMMAND_GROUPS = {
-    "terminal restore": ("ghostty",),
+    "terminal restore": ("ghostty", "alacritty"),
     "notifications/session supervision": ("notify-send", "uwsm"),
     "pick menu": ("walker", "wofi", "fuzzel", "rofi"),
     "web apps": ("omarchy-launch-webapp",),
@@ -165,6 +168,67 @@ def pi_sessions_for_cwd(cwd: str) -> list[str]:
 def latest_pi_session_for_cwd(cwd: str) -> str:
     sessions = pi_sessions_for_cwd(cwd)
     return sessions[0] if sessions else ""
+
+
+def pi_title_label(title: str) -> str:
+    title = title.strip()
+    if not title.lower().startswith("pi - "):
+        return ""
+    label = title[5:].split(":", 1)[0].strip().lower()
+    return label
+
+
+def pi_sessions_matching_label(label: str) -> list[str]:
+    if not label or not PI_SESSION_ROOT.exists():
+        return []
+    matches: list[Path] = []
+    needle = label.lower()
+    try:
+        session_dirs = [p for p in PI_SESSION_ROOT.iterdir() if p.is_dir()]
+    except Exception:
+        return []
+    home_prefix = "--" + str(Path.home()).strip("/").replace("/", "-")
+    for session_dir in session_dirs:
+        name = session_dir.name.lower()
+        if not name.startswith(home_prefix.lower()) or needle not in name:
+            continue
+        try:
+            matches.extend(p for p in session_dir.glob("*.jsonl") if p.is_file())
+        except Exception:
+            continue
+    return [str(p) for p in sorted(matches, key=lambda p: p.stat().st_mtime, reverse=True)]
+
+
+def legacy_pi_session_candidates(win: dict) -> list[str]:
+    """Best-effort Pi session candidates for old saves lacking agentSession.
+
+    Alacritty support was added after some session files were already saved, so
+    those records only have the title/cwd. Prefer exact cwd sessions except when
+    the saved cwd is the home directory and the title names a project; in that
+    common case the terminal process cwd was generic but the Pi title still has
+    the useful project label.
+    """
+    title = win.get("title") or ""
+    label = pi_title_label(title)
+    if not label:
+        return []
+
+    workdir = win.get("restoreWorkdir") or ""
+    home = str(Path.home())
+    cwd_sessions = pi_sessions_for_cwd(workdir) if workdir else []
+    title_sessions = pi_sessions_matching_label(label)
+    basename = Path(workdir).name.lower() if workdir else ""
+
+    ordered: list[str] = []
+    if workdir == home and label != basename:
+        ordered.extend(title_sessions)
+        ordered.extend(cwd_sessions)
+    else:
+        ordered.extend(cwd_sessions)
+        if not cwd_sessions:
+            ordered.extend(title_sessions)
+
+    return list(dict.fromkeys(ordered))
 
 
 def choose_unused_session(tool: str, sessions: list[str], used_sessions: dict[str, set[str]]) -> str:
@@ -371,7 +435,7 @@ def collect_windows() -> list[dict]:
         cwd, cmdline, workdir, argv = proc_info(pid)
         restore_argv: list[str] = []
         restore_session: dict = {}
-        if cls.lower() in {"com.mitchellh.ghostty", "ghostty"}:
+        if cls.lower() in TERMINAL_CLASSES:
             workdir, restore_argv, restore_session = terminal_child_state(pid, workdir, proc_children, used_sessions)
         ws = c.get("workspace") or {}
         grouped = c.get("grouped") or []
@@ -540,13 +604,74 @@ def lc_class(win: dict) -> str:
     return (win.get("class") or "").lower()
 
 
-def browser_app_args(win: dict) -> tuple[str, list[str]]:
+def normalized_proc_argv(win: dict) -> list[str]:
     argv = win.get("procArgv") or []
+    if isinstance(argv, str):
+        argv = [argv]
+    argv = [str(part) for part in argv]
+
+    # Some browser app windows expose their process cmdline as one space-joined
+    # string in /proc/<pid>/cmdline. Split that legacy/surprising shape back
+    # into arguments so --app/--user-data-dir can still be restored.
+    if len(argv) == 1 and " " in argv[0]:
+        try:
+            argv = shlex.split(argv[0])
+        except ValueError:
+            argv = []
     if not argv and win.get("procCmdline"):
         try:
             argv = shlex.split(win.get("procCmdline") or "")
+            if len(argv) == 1 and " " in argv[0]:
+                argv = shlex.split(argv[0])
         except ValueError:
             argv = []
+
+    # Repair the common unquoted Chromium form "--profile-directory=Profile 3"
+    # after splitting a single space-joined command string.
+    repaired: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("--profile-directory=") and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+            arg = f"{arg} {argv[i + 1]}"
+            i += 1
+        repaired.append(arg)
+        i += 1
+    return repaired
+
+
+def chrome_app_url_from_class(cls: str) -> str:
+    match = re.match(r"^chrome-([^_]+)__-", cls.lower())
+    if not match:
+        return ""
+    host = match.group(1).strip("-.")
+    if "." not in host:
+        return ""
+    return f"https://{host}/"
+
+
+def url_host(url: str) -> str:
+    try:
+        return (urlparse(url).netloc or "").lower().removeprefix("www.")
+    except Exception:
+        return ""
+
+
+def chrome_app_flags_from_class(cls: str) -> list[str]:
+    match = re.match(r"^chrome-[^_]+__-(.+)$", cls)
+    if not match:
+        return []
+    profile = match.group(1).strip()
+    if not profile:
+        return []
+    return [f"--profile-directory={profile}"]
+
+
+def browser_app_args(win: dict) -> tuple[str, list[str]]:
+    argv = normalized_proc_argv(win)
+    raw_class = win.get("class") or ""
+    cls = raw_class.lower()
+    class_url = chrome_app_url_from_class(cls)
 
     url = ""
     flags: list[str] = []
@@ -566,6 +691,14 @@ def browser_app_args(win: dict) -> tuple[str, list[str]]:
             flags.extend([arg, argv[i + 1]])
             i += 1
         i += 1
+
+    # Chromium web-app windows can all point at the browser's primary process,
+    # so proc argv may describe a different web app. Prefer the Hyprland class
+    # when the host disagrees; it is generated from the actual app window.
+    if class_url and (not url or url_host(url) != url_host(class_url)):
+        url = class_url
+        if not any(flag.startswith("--user-data-dir") for flag in flags):
+            flags = chrome_app_flags_from_class(raw_class)
     return url, flags
 
 
@@ -601,7 +734,7 @@ def restore_key(win: dict) -> str:
     if cls in SINGLETON_CLASSES:
         return f"app:{cls}"
     workdir = win.get("restoreWorkdir") or ""
-    if cls in {"com.mitchellh.ghostty", "ghostty"}:
+    if cls in TERMINAL_CLASSES:
         agent = win.get("agentSession") or {}
         if agent.get("tool") and agent.get("id") and agent.get("id") != "latest":
             return f"ws:{ws}|class:{cls}|agent:{agent.get('tool')}:{agent.get('id')}"
@@ -887,6 +1020,44 @@ def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str
     return False
 
 
+def enrich_legacy_terminal_targets(targets: list[dict]) -> None:
+    used_sessions: dict[str, set[str]] = {}
+    for win in targets:
+        if lc_class(win) not in TERMINAL_CLASSES:
+            continue
+        if win.get("restoreArgv") or (win.get("agentSession") or {}).get("id"):
+            continue
+        session = choose_unused_session("pi", legacy_pi_session_candidates(win), used_sessions)
+        if session:
+            win["restoreArgv"] = ["pi", "--session", session]
+            win["agentSession"] = {"tool": "pi", "id": session, "path": session, "match": "legacy-title-cwd"}
+            win["piSession"] = session
+
+
+def terminal_restore_argv(win: dict) -> list[str]:
+    restore_argv = win.get("restoreArgv") or []
+    if restore_argv:
+        return restore_argv
+
+    agent = win.get("agentSession") or {}
+    if agent.get("tool") == "pi" and agent.get("path"):
+        return ["pi", "--session", agent.get("path")]
+
+    # Legacy saves made before a terminal class was supported may still have a
+    # useful title but no child-process restore metadata. Reopen the obvious
+    # agent in the saved cwd rather than dropping the user into an empty shell.
+    title = (win.get("title") or "").strip().lower()
+    if title.startswith("pi - "):
+        return ["pi"]
+    if title.startswith("claude"):
+        return ["claude"]
+    if title.startswith("codex"):
+        return ["codex"]
+    if title.startswith("opencode"):
+        return ["opencode"]
+    return []
+
+
 def launch_command(win: dict) -> tuple[list[str] | None, str]:
     cls = lc_class(win)
     workdir = win.get("restoreWorkdir") or ""
@@ -896,8 +1067,15 @@ def launch_command(win: dict) -> tuple[list[str] | None, str]:
     if webapp_url and shutil.which("omarchy-launch-webapp"):
         cmd = ["omarchy-launch-webapp", webapp_url, *webapp_flags]
     elif cls in {"com.mitchellh.ghostty", "ghostty"}:
-        restore_argv = win.get("restoreArgv") or []
+        restore_argv = terminal_restore_argv(win)
         cmd = ["ghostty"]
+        if workdir and Path(workdir).is_dir():
+            cmd.append(f"--working-directory={workdir}")
+        if restore_argv:
+            cmd.extend(["-e", *restore_argv])
+    elif cls == "alacritty":
+        restore_argv = terminal_restore_argv(win)
+        cmd = ["alacritty"]
         if workdir and Path(workdir).is_dir():
             cmd.append(f"--working-directory={workdir}")
         if restore_argv:
@@ -922,7 +1100,7 @@ def launch_command(win: dict) -> tuple[list[str] | None, str]:
         cmd = ["nautilus", "--new-window"]
     elif cls == "thunderbird":
         cmd = ["thunderbird"]
-    elif cls == "keepassxc":
+    elif cls in {"keepassxc", "org.keepassxc.keepassxc"}:
         cmd = ["keepassxc"]
     elif cls in {"code", "code-url-handler", "visual-studio-code"}:
         cmd = ["code", workdir] if workdir and Path(workdir).is_dir() else ["code"]
@@ -979,6 +1157,7 @@ def window_summary(win: dict) -> str:
 def restore_dry_run(path: Path) -> None:
     data = load_session(path)
     targets = [w for w in data.get("windows", []) if workspace_spec(w) != "0"]
+    enrich_legacy_terminal_targets(targets)
     current_windows = collect_windows()
     current_counts = Counter(restore_key(w) for w in current_windows)
     monitor_moves = workspace_monitor_moves(targets)
@@ -1067,6 +1246,7 @@ def hard_undo() -> None:
 def restore(path: Path, *, save_undo: bool = True) -> None:
     data = load_session(path)
     targets = [w for w in data.get("windows", []) if workspace_spec(w) != "0"]
+    enrich_legacy_terminal_targets(targets)
 
     if save_undo:
         write_session(UNDO_FILE, quiet=True)

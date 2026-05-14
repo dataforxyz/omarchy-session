@@ -1,8 +1,8 @@
 # Workspace/session restore helper
 
-`omarchy-session` is a Hyprland/Ghostty workspace restore helper. It saves open
+`omarchy-session` is a Hyprland terminal workspace restore helper. It saves open
 windows, workspaces, scratchpad placement, Omarchy/Hyprland grouped tabs,
-Ghostty working directories, and best-effort commands for interactive terminal
+terminal working directories, and best-effort commands for interactive terminal
 workflows.
 
 Installed commands:
@@ -102,5 +102,5 @@ Terminal restore behavior is best effort:
   local OpenCode version accepts it, otherwise they fall back to plain `opencode`;
 - wrapper commands like `make ssh` and remote `make pi N=...` are restored by
   rerunning the original `make` command in the saved working directory;
-- unknown terminal workflows fall back to reopening Ghostty in the saved working
-  directory.
+- unknown terminal workflows fall back to reopening the saved terminal app in the
+  saved working directory when supported.
