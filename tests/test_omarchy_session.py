@@ -145,6 +145,42 @@ class RestoreCommandTests(unittest.TestCase):
                 self.assertEqual(reason, "")
                 self.assertEqual(cmd, ["keepassxc"])
 
+    def test_claude_alias_detection_and_restore_command(self):
+        mod = load_module()
+        self.assertEqual(mod.claude_command_from_env({}), "clo")
+        self.assertEqual(
+            mod.claude_command_from_env({"CLAUDE_CONFIG_DIR": "/home/me/.config/claude-aliases/profiles/deepseek"}),
+            "clod",
+        )
+        self.assertEqual(
+            mod.claude_command_from_env({"CLAUDE_CONFIG_DIR": "/home/me/.config/claude-aliases/profiles/cliproxy"}),
+            "cloc",
+        )
+        self.assertEqual(
+            mod.terminal_restore_argv({
+                "class": "Alacritty",
+                "agentSession": {"tool": "claude", "command": "cloc", "id": "abc-123"},
+            }),
+            ["cloc", "--resume", "abc-123"],
+        )
+
+    def test_legacy_alacritty_claude_title_reopens_clo(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
+                cmd, reason = mod.launch_command({
+                    "class": "Alacritty",
+                    "title": "Claude",
+                    "restoreWorkdir": str(workdir),
+                    "restoreArgv": [],
+                })
+                self.assertEqual(reason, "")
+                self.assertEqual(cmd, [
+                    "alacritty", f"--working-directory={workdir}",
+                    "-e", "bash", "-lc", '"$@"', "omarchy-session-restore", "clo",
+                ])
+
     def test_legacy_alacritty_pi_title_reopens_pi(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as tmp:

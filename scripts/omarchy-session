@@ -24,10 +24,15 @@ PROFILE_DIR = STATE_DIR / "profiles"
 AUTOSAVE_KEEP = 48
 PI_SESSION_ROOT = Path.home() / ".pi/agent/sessions"
 CLAUDE_PROJECT_ROOT = Path.home() / ".claude/projects"
+CLAUDE_ALIAS_COMMANDS = {"clo", "clod", "cloc"}
+CLAUDE_ALIAS_CONFIGS = {
+    "deepseek": "clod",
+    "cliproxy": "cloc",
+}
 CODEX_SESSION_ROOT = Path.home() / ".codex/sessions"
 OPENCODE_DB = Path.home() / ".local/share/opencode/opencode.db"
-MAKE_RESTORE_TARGETS = {"ssh", "pi", "claude", "codex", "opencode"}
-DIRECT_RESTORE_COMMANDS = {"ssh", "tmux", "claude", "codex", "opencode"}
+MAKE_RESTORE_TARGETS = {"ssh", "pi", "claude", "clo", "clod", "cloc", "codex", "opencode"}
+DIRECT_RESTORE_COMMANDS = {"ssh", "tmux", "claude", "clo", "clod", "cloc", "codex", "opencode"}
 EXCLUDED_CLASSES = {"zenity", "pinentry", "org.gnome.polkit", "xdg-desktop-portal"}
 SINGLETON_CLASSES = {
     "chromium", "chromium-browser", "brave-browser", "brave",
@@ -46,7 +51,7 @@ OPTIONAL_COMMAND_GROUPS = {
         "chromium", "brave", "google-chrome-stable", "firefox", "obsidian", "slack",
         "discord", "signal-desktop", "nautilus", "thunderbird", "keepassxc", "code",
     ),
-    "agent resume helpers": ("pi", "claude", "codex", "opencode"),
+    "agent resume helpers": ("pi", "claude", "clo", "clod", "cloc", "codex", "opencode"),
 }
 
 
@@ -92,6 +97,20 @@ def read_proc_argv(pid: int) -> list[str]:
         return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
     except Exception:
         return []
+
+
+def read_proc_environ(pid: int) -> dict[str, str]:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except Exception:
+        return {}
+    env: dict[str, str] = {}
+    for part in raw.split(b"\0"):
+        if b"=" not in part:
+            continue
+        key, value = part.split(b"=", 1)
+        env[key.decode(errors="replace")] = value.decode(errors="replace")
+    return env
 
 
 def read_proc_cwd(pid: int) -> str:
@@ -255,14 +274,14 @@ def choose_unused_session(tool: str, sessions: list[str], used_sessions: dict[st
     return ""
 
 
-def claude_project_dir_for_cwd(cwd: str) -> Path:
+def claude_project_dir_for_cwd(cwd: str, project_root: Path = CLAUDE_PROJECT_ROOT) -> Path:
     # Claude Code stores sessions by cwd with non-alphanumeric characters
     # replaced by '-': /home/me/src/foo.bar -> -home-me-src-foo-bar.
-    return CLAUDE_PROJECT_ROOT / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    return project_root / re.sub(r"[^A-Za-z0-9]", "-", cwd)
 
 
-def latest_claude_session_for_cwd(cwd: str) -> str:
-    session_dir = claude_project_dir_for_cwd(cwd)
+def latest_claude_session_for_cwd(cwd: str, project_root: Path = CLAUDE_PROJECT_ROOT) -> str:
+    session_dir = claude_project_dir_for_cwd(cwd, project_root)
     try:
         sessions = [p for p in session_dir.glob("*.jsonl") if p.is_file()]
     except Exception:
@@ -270,6 +289,31 @@ def latest_claude_session_for_cwd(cwd: str) -> str:
     if not sessions:
         return ""
     return max(sessions, key=lambda p: p.stat().st_mtime).stem
+
+
+def claude_project_root_from_env(env: dict[str, str]) -> Path:
+    config_dir = env.get("CLAUDE_CONFIG_DIR") or ""
+    if config_dir:
+        return Path(config_dir) / "projects"
+    return CLAUDE_PROJECT_ROOT
+
+
+def claude_command_from_env(env: dict[str, str]) -> str:
+    config_dir = (env.get("CLAUDE_CONFIG_DIR") or "").rstrip("/")
+    profile = Path(config_dir).name if config_dir else ""
+    if profile in CLAUDE_ALIAS_CONFIGS:
+        return CLAUDE_ALIAS_CONFIGS[profile]
+
+    base_url = (env.get("ANTHROPIC_BASE_URL") or "").lower()
+    if "deepseek" in base_url:
+        return "clod"
+    if "cliproxy" in base_url or "cli-proxy" in base_url:
+        return "cloc"
+
+    # Local Claude Code should be restored through the user's normal wrapper.
+    # The `clo` wrapper clears provider overrides before execing `claude`, which
+    # avoids reopening a provider-specific session with the wrong credentials.
+    return "clo"
 
 
 def latest_codex_session_for_cwd(cwd: str) -> str:
@@ -350,11 +394,24 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
                 return cwd, ["pi", "--session", session], {"tool": "pi", "id": session, "path": session, "match": "cwd-newest-unused"}
             return cwd, ["pi", "--continue"], {"tool": "pi", "id": "latest", "match": "continue"}
 
-        if exe == "claude":
-            session = latest_claude_session_for_cwd(cwd)
+        if exe == "claude" or exe in CLAUDE_ALIAS_COMMANDS:
+            env = read_proc_environ(child_pid)
+            command = exe if exe in CLAUDE_ALIAS_COMMANDS else claude_command_from_env(env)
+            project_root = claude_project_root_from_env(env)
+            session = latest_claude_session_for_cwd(cwd, project_root)
             if session:
-                return cwd, ["claude", "--resume", session], {"tool": "claude", "id": session}
-            return cwd, ["claude", "--continue"], {"tool": "claude", "id": "latest"}
+                return cwd, [command, "--resume", session], {
+                    "tool": "claude",
+                    "id": session,
+                    "command": command,
+                    "projectRoot": str(project_root),
+                }
+            return cwd, [command, "--continue"], {
+                "tool": "claude",
+                "id": "latest",
+                "command": command,
+                "projectRoot": str(project_root),
+            }
 
         if exe == "codex":
             session = latest_codex_session_for_cwd(cwd)
@@ -1056,6 +1113,12 @@ def terminal_restore_argv(win: dict) -> list[str]:
     agent = win.get("agentSession") or {}
     if agent.get("tool") == "pi" and agent.get("path"):
         return ["pi", "--session", agent.get("path")]
+    if agent.get("tool") == "claude" and agent.get("command"):
+        command = agent.get("command")
+        session = agent.get("id") or ""
+        if session and session != "latest":
+            return [command, "--resume", session]
+        return [command, "--continue"]
 
     # Legacy saves made before a terminal class was supported may still have a
     # useful title but no child-process restore metadata. Reopen the obvious
@@ -1063,8 +1126,12 @@ def terminal_restore_argv(win: dict) -> list[str]:
     title = (win.get("title") or "").strip().lower()
     if title.startswith("pi - "):
         return ["pi"]
-    if title.startswith("claude"):
-        return ["claude"]
+    if title.startswith("clod"):
+        return ["clod"]
+    if title.startswith("cloc"):
+        return ["cloc"]
+    if title.startswith("clo") or title.startswith("claude"):
+        return ["clo"]
     if title.startswith("codex"):
         return ["codex"]
     if title.startswith("opencode"):
