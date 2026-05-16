@@ -138,7 +138,7 @@ class RestoreCommandTests(unittest.TestCase):
                 self.assertEqual(reason, "")
                 self.assertEqual(cmd, [
                     "alacritty", f"--working-directory={workdir}",
-                    "-e", "bash", "-lc", '"$@"', "omarchy-session-restore", "pi",
+                    "-e", "bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l', "omarchy-session-restore", "pi",
                 ])
 
                 cmd, reason = mod.launch_command({"class": "org.keepassxc.KeePassXC"})
@@ -178,7 +178,7 @@ class RestoreCommandTests(unittest.TestCase):
                 self.assertEqual(reason, "")
                 self.assertEqual(cmd, [
                     "alacritty", f"--working-directory={workdir}",
-                    "-e", "bash", "-lc", '"$@"', "omarchy-session-restore", "clo",
+                    "-e", "bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l', "omarchy-session-restore", "clo",
                 ])
 
     def test_legacy_alacritty_pi_title_reopens_pi(self):
@@ -200,7 +200,7 @@ class RestoreCommandTests(unittest.TestCase):
                 self.assertEqual(reason, "")
                 self.assertEqual(cmd, [
                     "alacritty", f"--working-directory={workdir}",
-                    "-e", "bash", "-lc", '"$@"', "omarchy-session-restore",
+                    "-e", "bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l', "omarchy-session-restore",
                     "pi", "--session", str(session),
                 ])
 

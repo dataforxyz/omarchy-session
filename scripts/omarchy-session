@@ -1148,7 +1148,9 @@ def terminal_exec_argv(restore_argv: list[str]) -> list[str]:
     # shell child of the terminal. If we launch `alacritty -e pi --session ...`,
     # the terminal's direct child is `pi`, so Super+Return falls back to $HOME.
     # Keep a shell as the direct child and run the restored command underneath it.
-    return ["bash", "-lc", '"$@"', "omarchy-session-restore", *restore_argv]
+    # The trailing exec also prevents bash from optimizing itself away into the
+    # final command, and leaves a useful shell if the restored agent exits.
+    return ["bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l', "omarchy-session-restore", *restore_argv]
 
 
 def launch_command(win: dict) -> tuple[list[str] | None, str]:
