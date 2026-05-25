@@ -56,14 +56,16 @@ Normal command output is summary-first: it shows counts and relative ages like `
 
 By default that directory contains the latest save (`last-session.json`), named
 profiles (`profiles/*.json`), autosaves (`autosaves/*.json`), the soft-undo
-snapshot (`before-last-restore.json`), and the last restore launch record
-(`last-restore.json`).
+snapshot (`before-last-restore.json`), the last restore launch record
+(`last-restore.json`), and the last restore audit record
+(`last-restore-audit.json`).
 
 Treat these files as private. They are local JSON, but can include sensitive
 workflow details such as `procCmdline`, `procArgv`, `restoreWorkdir`,
 `agentSession` IDs/paths, host name, timestamps, window classes, window titles,
-workspace/monitor names, process IDs, and restore command hints. Review and
-redact them before sharing bug reports, screenshots, test fixtures, or commits.
+workspace/monitor names, process IDs, restore command hints, and before/after
+restore audit snapshots. Review and redact them before sharing bug reports,
+screenshots, test fixtures, or commits.
 
 ## Requirements
 

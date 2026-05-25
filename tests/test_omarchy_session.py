@@ -178,6 +178,7 @@ class DryRunTests(unittest.TestCase):
             mod.verify_saved_groups = lambda targets, assigned: []
             mod.restore_saved_focus = lambda data, targets, assigned, fallback: (False, True)
             mod.write_last_restore = lambda path, launched: None
+            mod.write_restore_audit = lambda *args, **kwargs: None
             mod.notify = lambda title, body="": None
 
             out = io.StringIO()
@@ -191,6 +192,86 @@ class DryRunTests(unittest.TestCase):
             self.assertIn("state dispatch failures 1", text)
             self.assertIn("monitor placement failures 1", text)
             self.assertIn("focus restore failed", text)
+
+    def test_restore_writes_audit_with_before_after_and_verification(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            session = tmp_path / "session.json"
+            session.write_text(json.dumps({
+                "activeWindow": {"address": "0x2", "workspace": {"id": 2, "name": "2"}},
+                "windows": [
+                    {
+                        "address": "0x1",
+                        "class": "firefox",
+                        "title": "Already",
+                        "workspace": {"id": 1, "name": "1"},
+                        "monitorName": "HDMI-A-1",
+                    },
+                    {
+                        "address": "0x2",
+                        "class": "alacritty",
+                        "title": "Terminal",
+                        "workspace": {"id": 2, "name": "2"},
+                        "monitorName": "HDMI-A-1",
+                    },
+                ],
+            }))
+            before_windows = [{
+                "address": "0xc1",
+                "class": "firefox",
+                "title": "Already",
+                "workspace": {"id": 1, "name": "1"},
+                "monitorName": "HDMI-A-1",
+            }]
+            after_windows = [
+                before_windows[0],
+                {
+                    "address": "0xc2",
+                    "class": "alacritty",
+                    "title": "Terminal",
+                    "workspace": {"id": 2, "name": "2"},
+                    "monitorName": "HDMI-A-1",
+                },
+                {
+                    "address": "0xextra",
+                    "class": "notes",
+                    "title": "Extra",
+                    "workspace": {"id": 9, "name": "9"},
+                    "monitorName": "HDMI-A-1",
+                },
+            ]
+            collections = iter([before_windows, after_windows])
+            mod.collect_windows = lambda: next(collections)
+            mod.active_window = lambda: {"address": "0xc2", "workspace": {"id": 2, "name": "2"}}
+            mod.restore_workspace_monitors = lambda targets: (1, 0)
+            mod.launch_result = lambda win: "launched"
+            mod.apply_saved_state = lambda win, before_addresses: ("0xc2", 0)
+            mod.restore_groups = lambda targets: (0, {})
+            mod.verify_saved_groups = lambda targets, assigned: []
+            mod.restore_saved_focus = lambda data, targets, assigned, fallback: (True, True)
+            mod.notify = lambda title, body="": None
+            mod.LAST_RESTORE_FILE = tmp_path / "last-restore.json"
+            mod.LAST_RESTORE_AUDIT_FILE = tmp_path / "last-restore-audit.json"
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                mod.restore(session, save_undo=False)
+
+            text = out.getvalue()
+            self.assertIn("audit saved", text)
+            self.assertTrue(mod.LAST_RESTORE_FILE.exists())
+            self.assertTrue(mod.LAST_RESTORE_AUDIT_FILE.exists())
+            audit = json.loads(mod.LAST_RESTORE_AUDIT_FILE.read_text())
+            self.assertEqual(audit["source"], str(session))
+            self.assertEqual(audit["before"]["windowCount"], 1)
+            self.assertEqual(audit["after"]["windowCount"], 3)
+            self.assertEqual(audit["summary"]["launched"], 1)
+            self.assertEqual(audit["verification"]["matchedCount"], 2)
+            self.assertEqual(audit["verification"]["missingCount"], 0)
+            self.assertEqual(audit["verification"]["extraNewWindowCount"], 1)
+            self.assertTrue(audit["verification"]["matchedWellEnough"])
+            self.assertEqual(audit["launched"][0]["address"], "0xc2")
 
     def test_restore_dry_run_cli_forms(self):
         mod = load_module()

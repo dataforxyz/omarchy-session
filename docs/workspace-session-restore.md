@@ -63,7 +63,8 @@ Runtime state lives in `~/.local/state/omarchy-session/` and includes:
 - `profiles/*.json` — named profiles;
 - `autosaves/*.json` and `autosaves/latest.json` — autosave history;
 - `before-last-restore.json` — soft-undo snapshot;
-- `last-restore.json` — windows launched by the most recent real restore.
+- `last-restore.json` — windows launched by the most recent real restore;
+- `last-restore-audit.json` — most recent real restore audit with before/after snapshots, intended targets, launched windows, and verification details.
 
 Review those files before sharing them. They can contain window titles, window
 classes, workspace and monitor names, host name, timestamps, process IDs,
@@ -73,7 +74,9 @@ Hyprland window metadata, `/proc` process command lines/working directories, and
 local Pi/Claude/Codex/OpenCode session metadata to make restore more useful; it
 does not intentionally collect secrets, but commands, paths, titles, and agent
 session IDs can reveal private project names, server names, prompts, URLs, or
-other sensitive context. Use synthetic or redacted data for bug reports and test
+other sensitive context. Restore audit records intentionally include before/after
+window snapshots and desired-vs-actual comparisons, so treat them as at least as
+private as saved sessions. Use synthetic or redacted data for bug reports and test
 fixtures.
 
 Hyprland grouped tabs created with `Super+G` are saved from Hyprland's `grouped`
@@ -96,7 +99,13 @@ and focus restore failures.
 Before each restore, the current layout is saved to a soft-undo snapshot used by
 `ws u`. Restore also records the addresses of windows it actually launched in
 `last-restore.json`; `ws undo-hard` closes only those launched windows that are
-still present, leaving pre-existing windows alone.
+still present, leaving pre-existing windows alone. Each real restore also writes
+`last-restore-audit.json`, containing the before snapshot, intended targets,
+after snapshot, launched window records, restore summary counters, and a
+verification section with matched/missing targets, extra new windows,
+workspace/monitor mismatches where detectable, group verification details, and
+focus outcome. Normal restore output only notes that the audit was saved; use
+`-v` to show the audit path.
 
 Terminal restore behavior is best effort:
 

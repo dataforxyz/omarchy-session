@@ -18,6 +18,7 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 SESSION_FILE = STATE_DIR / "last-session.json"
 UNDO_FILE = STATE_DIR / "before-last-restore.json"
 LAST_RESTORE_FILE = STATE_DIR / "last-restore.json"
+LAST_RESTORE_AUDIT_FILE = STATE_DIR / "last-restore-audit.json"
 AUTOSAVE_DIR = STATE_DIR / "autosaves"
 LATEST_AUTOSAVE = AUTOSAVE_DIR / "latest.json"
 PROFILE_DIR = STATE_DIR / "profiles"
@@ -1471,6 +1472,187 @@ def window_summary(win: dict) -> str:
     return f"workspace {workspace_spec(win)}: {win.get('class')}{title_part}"
 
 
+def audit_window_record(win: dict) -> dict:
+    record = {
+        "address": win.get("address") or "",
+        "class": win.get("class") or "",
+        "title": win.get("title") or "",
+        "workspace": win.get("workspace") or {},
+        "workspaceSpec": workspace_spec(win),
+        "monitor": win.get("monitor"),
+        "monitorName": win.get("monitorName") or "",
+        "restoreKey": restore_key(win),
+        "grouped": win.get("grouped") or [],
+        "groupIndex": win.get("groupIndex", 0),
+        "groupSize": win.get("groupSize", 0),
+    }
+    if win.get("restoreWorkdir"):
+        record["restoreWorkdir"] = win.get("restoreWorkdir")
+    if win.get("restoreArgv"):
+        record["restoreArgv"] = win.get("restoreArgv")
+    if win.get("agentSession"):
+        record["agentSession"] = win.get("agentSession")
+    return record
+
+
+def monitor_audit_value(win: dict) -> str:
+    if win.get("monitorName"):
+        return str(win.get("monitorName"))
+    monitor = win.get("monitor")
+    return str(monitor) if monitor is not None else ""
+
+
+def restore_verification(
+    targets: list[dict],
+    before_windows: list[dict],
+    after_windows: list[dict],
+    group_assessments: list[dict],
+    focus_restored: bool,
+    focus_attempted: bool,
+) -> dict:
+    assigned = assign_current_addresses(targets, after_windows)
+    after_by_address = {w.get("address") or "": w for w in after_windows if w.get("address")}
+    before_addresses = {w.get("address") or "" for w in before_windows if w.get("address")}
+    matched_current_addresses: set[str] = set()
+    matched_targets = []
+    missing_targets = []
+    workspace_mismatches = []
+    monitor_mismatches = []
+
+    for target in targets:
+        saved_address = target.get("address") or ""
+        target_record = audit_window_record(target)
+        current_address = assigned.get(saved_address, "")
+        actual = after_by_address.get(current_address, {}) if current_address else {}
+        if not actual:
+            missing_targets.append(target_record)
+            continue
+
+        matched_current_addresses.add(current_address)
+        actual_record = audit_window_record(actual)
+        matched_targets.append({
+            "savedAddress": saved_address,
+            "currentAddress": current_address,
+            "target": target_record,
+            "actual": actual_record,
+        })
+
+        target_ws = workspace_spec(target)
+        actual_ws = workspace_spec(actual)
+        if target_ws and actual_ws and target_ws != actual_ws:
+            workspace_mismatches.append({
+                "savedAddress": saved_address,
+                "currentAddress": current_address,
+                "expected": target_ws,
+                "actual": actual_ws,
+                "target": target_record,
+                "actualWindow": actual_record,
+            })
+
+        target_monitor = monitor_audit_value(target)
+        actual_monitor = monitor_audit_value(actual)
+        if target_monitor and actual_monitor and target_monitor != actual_monitor:
+            monitor_mismatches.append({
+                "savedAddress": saved_address,
+                "currentAddress": current_address,
+                "expected": target_monitor,
+                "actual": actual_monitor,
+                "target": target_record,
+                "actualWindow": actual_record,
+            })
+
+    extra_new_windows = [
+        audit_window_record(win)
+        for win in after_windows
+        if (win.get("address") or "") not in before_addresses
+        and (win.get("address") or "") not in matched_current_addresses
+    ]
+    group_counts = dict(group_status_counts(group_assessments, ["correct", "partial_missing", "failed", "cannot_assess"]))
+    focus_failed = focus_attempted and not focus_restored
+    matched_well_enough = not (
+        missing_targets
+        or workspace_mismatches
+        or monitor_mismatches
+        or group_counts.get("partial_missing", 0)
+        or group_counts.get("failed", 0)
+        or group_counts.get("cannot_assess", 0)
+        or focus_failed
+    )
+
+    return {
+        "matchedWellEnough": matched_well_enough,
+        "targetCount": len(targets),
+        "matchedCount": len(matched_targets),
+        "missingCount": len(missing_targets),
+        "extraNewWindowCount": len(extra_new_windows),
+        "workspaceMismatchCount": len(workspace_mismatches),
+        "monitorMismatchCount": len(monitor_mismatches),
+        "matchedTargets": matched_targets,
+        "missingTargets": missing_targets,
+        "extraNewWindows": extra_new_windows,
+        "workspaceMismatches": workspace_mismatches,
+        "monitorMismatches": monitor_mismatches,
+        "groups": {
+            "counts": group_counts,
+            "details": group_assessments,
+        },
+        "focus": {
+            "attempted": focus_attempted,
+            "restored": focus_restored,
+            "failed": focus_failed,
+        },
+    }
+
+
+def write_restore_audit(
+    source: Path,
+    before_windows: list[dict],
+    before_active: dict,
+    targets: list[dict],
+    after_windows: list[dict],
+    after_active: dict,
+    launched_windows: list[dict],
+    summary: dict,
+    group_assessments: list[dict],
+    focus_restored: bool,
+    focus_attempted: bool,
+) -> Path | None:
+    verification = restore_verification(
+        targets, before_windows, after_windows, group_assessments, focus_restored, focus_attempted
+    )
+    data = {
+        "restoredAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": str(source),
+        "summary": summary,
+        "before": {
+            "activeWindow": before_active,
+            "windowCount": len(before_windows),
+            "windows": before_windows,
+        },
+        "intended": {
+            "targetCount": len(targets),
+            "targets": [audit_window_record(w) for w in targets],
+        },
+        "after": {
+            "activeWindow": after_active,
+            "windowCount": len(after_windows),
+            "windows": after_windows,
+        },
+        "launched": launched_windows,
+        "verification": verification,
+    }
+    try:
+        LAST_RESTORE_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LAST_RESTORE_AUDIT_FILE.with_suffix(LAST_RESTORE_AUDIT_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        tmp.replace(LAST_RESTORE_AUDIT_FILE)
+        return LAST_RESTORE_AUDIT_FILE
+    except Exception as exc:
+        if VERBOSE:
+            print(f"Restore audit not saved: {exc}", file=sys.stderr)
+        return None
+
+
 def restore_dry_run(path: Path) -> None:
     data = load_session(path)
     targets = [w for w in data.get("windows", []) if workspace_spec(w) != "0"]
@@ -1597,6 +1779,7 @@ def restore(path: Path, *, save_undo: bool = True) -> None:
 
     fallback_active = active_window()
     current_windows = collect_windows()
+    before_active = active_session_snapshot(current_windows)
     before_addresses = {w.get("address") or "" for w in current_windows}
     current_counts = Counter(restore_key(w) for w in current_windows)
     monitors_restored, monitor_failures = restore_workspace_monitors(targets)
@@ -1679,7 +1862,46 @@ def restore(path: Path, *, save_undo: bool = True) -> None:
         launch_issues.append(f"state dispatch failures {state_dispatch_failed}")
     if launch_issues:
         launch_note = f", {', '.join(launch_issues)}"
-    print(f"Restore checked {len(targets)} saved windows: launched {launched}, already open {skipped_open}, skipped {skipped_unknown}{launch_note}{group_note}{monitor_note}{focus_note}")
+
+    try:
+        after_windows = collect_windows()
+        after_active = active_session_snapshot(after_windows)
+    except Exception:
+        after_windows = []
+        after_active = {}
+    summary = {
+        "targetCount": len(targets),
+        "launched": launched,
+        "alreadyOpen": skipped_open,
+        "skipped": skipped_unknown,
+        "launchDispatchFailed": launch_dispatch_failed,
+        "launchedUndetected": launched_undetected,
+        "stateDispatchFailures": state_dispatch_failed,
+        "groupsActivelyRestored": groups_restored,
+        "groupCount": group_count,
+        "groupCounts": dict(group_counts),
+        "monitorPlacements": monitors_restored,
+        "monitorPlacementFailures": monitor_failures,
+        "focusRestored": focus_restored,
+        "focusAttempted": focus_attempted,
+    }
+    audit_path = write_restore_audit(
+        path,
+        current_windows,
+        before_active,
+        targets,
+        after_windows,
+        after_active,
+        launched_windows,
+        summary,
+        group_assessments,
+        focus_restored,
+        focus_attempted,
+    )
+    audit_note = ""
+    if audit_path:
+        audit_note = f", audit saved{f' at {human_path(audit_path)}' if VERBOSE else ''}"
+    print(f"Restore checked {len(targets)} saved windows: launched {launched}, already open {skipped_open}, skipped {skipped_unknown}{launch_note}{group_note}{monitor_note}{focus_note}{audit_note}")
     notify("Omarchy session restore", f"Launched {launched}; already open {skipped_open}; groups correct {group_counts.get('correct', 0)}/{group_count}")
 
 
@@ -1873,6 +2095,16 @@ def health_status() -> None:
             print(f"  last restore: unreadable ({LAST_RESTORE_FILE})")
     else:
         print("  last restore: missing")
+    if LAST_RESTORE_AUDIT_FILE.exists():
+        try:
+            data = load_session(LAST_RESTORE_AUDIT_FILE)
+            verification = data.get("verification") or {}
+            verdict = "matched" if verification.get("matchedWellEnough") else "needs review"
+            print(f"  restore audit: {verdict}, {file_age(LAST_RESTORE_AUDIT_FILE)}")
+        except Exception:
+            print(f"  restore audit: unreadable ({LAST_RESTORE_AUDIT_FILE})")
+    else:
+        print("  restore audit: missing")
     print("  shortcuts:")
     print(shortcuts_help_block())
     print("  commands: ws s, ws r, ws plan, ws pick, ws a, ws as, ws u, ws undo-hard, ws status, ws deps")
