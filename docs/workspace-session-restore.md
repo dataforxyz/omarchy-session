@@ -19,6 +19,8 @@ Installed commands:
 - `ws st` / `ws status` — show autosave health, save ages/counts, install path, shortcuts, and last-restore info
 - `ws deps` / `ws doctor` / `ws check` — show required and optional dependency status
 
+Default output is summary-first: saves/autosaves report window/workspace counts, terminal resumes, groups, and relative ages like `12m ago` instead of full state-file paths or raw timestamps. Use `-v` / `--verbose` (for example, `ws -v l`) when you need saved paths, raw timestamps, and restore metadata; `ws path [name]` still prints just the path for scripting.
+
 The script is source-controlled at `scripts/omarchy-session`. Install it with:
 
 ```bash
@@ -44,7 +46,9 @@ Use `ws plan [name]`, `ws dry-run [name]`, `ws r --dry-run [name]`, or
 plan loads the saved session and compares it with the current Hyprland windows.
 It reports windows that are already open, windows that would be launched, windows
 that would be skipped because the app class or optional command is unavailable,
-and monitor/group/focus actions that would be attempted.
+and monitor/group/focus actions. Group reporting distinguishes groups that are
+already correct, would need regrouping, have partial/missing members, or cannot
+be assessed; `-v` adds per-group member detail.
 
 Dry-run mode is intentionally read-only: it does not call Hyprland dispatch,
 launch apps, write the undo snapshot, write `last-restore.json`, send desktop
@@ -74,14 +78,20 @@ fixtures.
 
 Hyprland grouped tabs created with `Super+G` are saved from Hyprland's `grouped`
 metadata. Restore recreates those groups best-effort after windows are relaunched
-or matched to already-open windows. Tab order is preserved when Hyprland accepts
-the regrouping commands. New saves also record the active workspace/window, so
-restore returns to the saved workspace and active grouped tab when possible.
+or matched to already-open windows, then verifies saved groups again so the final
+summary separates groups that were actively restored from groups that are correct,
+partial/missing, failed, or could not be assessed. Tab order is preserved when
+Hyprland accepts the regrouping commands. New saves also record the active
+workspace/window, so restore returns to the saved workspace and active grouped tab
+when possible.
 
 Window records include Hyprland monitor IDs and names. Restore moves saved
 workspaces back to their saved monitor when that monitor still exists, falling
 back safely when monitor names changed after a reinstall, dock change, or laptop
-undock.
+undock. Restore-time Hyprland dispatches are retried briefly when possible, and
+the final summary reports detectable launch dispatch failures, launched windows
+that were not observed, saved-state dispatch failures, monitor placement failures,
+and focus restore failures.
 
 Before each restore, the current layout is saved to a soft-undo snapshot used by
 `ws u`. Restore also records the addresses of windows it actually launched in

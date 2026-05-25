@@ -42,6 +42,8 @@ SINGLETON_CLASSES = {
 }
 TERMINAL_CLASSES = {"com.mitchellh.ghostty", "ghostty", "alacritty"}
 REQUIRED_COMMANDS = ("hyprctl",)
+VERBOSE = False
+
 OPTIONAL_COMMAND_GROUPS = {
     "terminal restore": ("ghostty", "alacritty"),
     "notifications/session supervision": ("notify-send", "uwsm"),
@@ -573,6 +575,48 @@ def active_session_snapshot(windows: list[dict]) -> dict:
     }
 
 
+def human_path(path: Path | str) -> str:
+    text = str(path)
+    home = str(Path.home())
+    if text == home:
+        return "~"
+    if text.startswith(home + "/"):
+        return "~" + text[len(home):]
+    return text
+
+
+def plural(count: int, singular: str, plural_word: str | None = None) -> str:
+    word = singular if count == 1 else (plural_word or f"{singular}s")
+    return f"{count} {word}"
+
+
+def session_summary(windows: list[dict]) -> str:
+    workspaces = {workspace_spec(w) for w in windows if workspace_spec(w) != "0"}
+    grouped = {tuple(w.get("grouped") or []) for w in windows if len(w.get("grouped") or []) > 1}
+    terminal_resumes = sum(
+        1 for w in windows
+        if lc_class(w) in TERMINAL_CLASSES and (w.get("restoreArgv") or (w.get("agentSession") or {}).get("id"))
+    )
+    parts = [plural(len(windows), "window")]
+    if workspaces:
+        parts.append(f"across {plural(len(workspaces), 'workspace')}")
+    if terminal_resumes:
+        parts.append(plural(terminal_resumes, "terminal resume"))
+    if grouped:
+        parts.append(plural(len(grouped), "group"))
+    return ", ".join(parts)
+
+
+def session_file_summary(path: Path) -> str:
+    if not path.exists() and not path.is_symlink():
+        return "missing"
+    try:
+        data = json.loads(path.read_text())
+        return f"{session_summary(data.get('windows', []))}, {file_age(path)}"
+    except Exception:
+        return "unreadable"
+
+
 def write_session(path: Path, *, quiet: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     windows = collect_windows()
@@ -586,9 +630,9 @@ def write_session(path: Path, *, quiet: bool = False) -> None:
     tmp.write_text(json.dumps(data, indent=2) + "\n")
     tmp.replace(path)
     if not quiet:
-        count = len(data["windows"])
-        print(f"Saved {count} windows to {path}")
-        notify("Omarchy session saved", f"{count} windows saved")
+        target = f" ({human_path(path)})" if VERBOSE else ""
+        print(f"Saved {session_summary(data['windows'])}{target}")
+        notify("Omarchy session saved", f"{len(data['windows'])} windows saved")
 
 
 def cleanup_autosaves(keep: int = AUTOSAVE_KEEP) -> None:
@@ -652,13 +696,14 @@ def autosave_loop() -> None:
 
 def list_autosaves() -> None:
     if not AUTOSAVE_DIR.exists():
-        print(f"No autosaves found at {AUTOSAVE_DIR}")
+        print(f"No autosaves found at {human_path(AUTOSAVE_DIR)}")
         return
     for path in sorted(AUTOSAVE_DIR.glob("*.json")):
         marker = " -> latest" if path.resolve() == LATEST_AUTOSAVE.resolve() else ""
         if path.name == "latest.json":
             continue
-        print(f"{path}{marker}")
+        label = human_path(path) if VERBOSE else path.stem
+        print(f"{label}: {session_file_summary(path)}{marker}")
 
 
 def load_session(path: Path) -> dict:
@@ -760,6 +805,13 @@ def browser_app_args(win: dict) -> tuple[str, list[str]]:
             i += 1
         i += 1
 
+    # A plain browser class (e.g. "chromium") is a regular browser window, not
+    # a web app. Its procCmdline can still contain --app=... when it was spawned
+    # by a Chromium master process that was originally launched as a web app;
+    # ignore that inherited flag so we relaunch a regular browser window.
+    if not class_url and cls in SINGLETON_CLASSES:
+        return "", []
+
     # Chromium web-app windows can all point at the browser's primary process,
     # so proc argv may describe a different web app. Prefer the Hyprland class
     # when the host disagrees; it is generated from the actual app window.
@@ -816,15 +868,24 @@ def uwsm_cmd(cmd: list[str]) -> list[str]:
     return cmd
 
 
-def hypr(*args: str) -> None:
-    subprocess.run(["hyprctl", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def hypr(*args: str, retries: int = 1, delay: float = 0.08) -> bool:
+    for attempt in range(retries + 1):
+        try:
+            result = subprocess.run(["hyprctl", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0:
+                return True
+        except Exception:
+            pass
+        if attempt < retries:
+            time.sleep(delay)
+    return False
 
 
-def hypr_exec_on_workspace(cmd: list[str], ws: str) -> None:
+def hypr_exec_on_workspace(cmd: list[str], ws: str) -> bool:
     # Hyprland exec rules launch on the target workspace without switching your
     # current focus there. This avoids restore yanking you around.
     rule = f"[workspace {ws} silent] " if ws else ""
-    hypr("dispatch", "exec", rule + shlex.join(uwsm_cmd(cmd)))
+    return hypr("dispatch", "exec", rule + shlex.join(uwsm_cmd(cmd)), retries=2)
 
 
 def monitor_target(win: dict) -> str:
@@ -858,11 +919,15 @@ def workspace_monitor_moves(targets: list[dict]) -> list[tuple[str, str]]:
     return moves
 
 
-def restore_workspace_monitors(targets: list[dict]) -> int:
-    moves = workspace_monitor_moves(targets)
-    for ws, monitor in moves:
-        hypr("dispatch", "moveworkspacetomonitor", f"{ws} {monitor}")
-    return len(moves)
+def restore_workspace_monitors(targets: list[dict]) -> tuple[int, int]:
+    moved = 0
+    failed = 0
+    for ws, monitor in workspace_monitor_moves(targets):
+        if hypr("dispatch", "moveworkspacetomonitor", f"{ws} {monitor}", retries=2):
+            moved += 1
+        else:
+            failed += 1
+    return moved, failed
 
 
 def find_new_window(target: dict, before_addresses: set[str], timeout: float = 6.0) -> dict | None:
@@ -881,32 +946,35 @@ def find_new_window(target: dict, before_addresses: set[str], timeout: float = 6
     return None
 
 
-def apply_saved_state(target: dict, before_addresses: set[str]) -> str:
+def apply_saved_state(target: dict, before_addresses: set[str]) -> tuple[str, int]:
     win = find_new_window(target, before_addresses)
     if not win:
-        return ""
+        return "", 0
     address = win.get("address") or ""
     if not address:
-        return ""
+        return "", 0
     before_addresses.add(address)
+    failed_dispatches = 0
 
     ws = workspace_spec(target)
     if ws.startswith("special:"):
-        hypr("dispatch", "movetoworkspacesilent", f"{ws},address:{address}")
-        return address
+        if not hypr("dispatch", "movetoworkspacesilent", f"{ws},address:{address}", retries=2):
+            failed_dispatches += 1
+        return address, failed_dispatches
 
     # Best-effort: geometry restore is useful mostly for floating windows. Tiled
     # windows are intentionally left to Hyprland's layout. Avoid focuswindow here
     # so restore does not steal focus.
     if target.get("floating"):
-        hypr("dispatch", "setfloating", f"address:{address}")
+        if not hypr("dispatch", "setfloating", f"address:{address}", retries=2):
+            failed_dispatches += 1
         size = target.get("size") or []
         at = target.get("at") or []
-        if len(size) == 2:
-            hypr("dispatch", "resizewindowpixel", f"exact {size[0]} {size[1]},address:{address}")
-        if len(at) == 2:
-            hypr("dispatch", "movewindowpixel", f"exact {at[0]} {at[1]},address:{address}")
-    return address
+        if len(size) == 2 and not hypr("dispatch", "resizewindowpixel", f"exact {size[0]} {size[1]},address:{address}", retries=2):
+            failed_dispatches += 1
+        if len(at) == 2 and not hypr("dispatch", "movewindowpixel", f"exact {at[0]} {at[1]},address:{address}", retries=2):
+            failed_dispatches += 1
+    return address, failed_dispatches
 
 
 def active_window() -> dict:
@@ -938,14 +1006,15 @@ def addresses_same_group(addresses: list[str]) -> bool:
     return False
 
 
-def assign_current_addresses(targets: list[dict]) -> dict[str, str]:
+def assign_current_addresses(targets: list[dict], current: list[dict] | None = None) -> dict[str, str]:
     """Map saved Hyprland addresses to current ones after restore.
 
     Addresses change after reboot, so this uses stable restore keys and then
     falls back to workspace/class/title matching. It is only used for best-effort
     Hyprland group/tab restoration.
     """
-    current = collect_windows()
+    if current is None:
+        current = collect_windows()
     used: set[str] = set()
     assigned: dict[str, str] = {}
 
@@ -985,15 +1054,26 @@ def assign_current_addresses(targets: list[dict]) -> dict[str, str]:
     return assigned
 
 
+def wait_for_same_group(addresses: list[str], timeout: float = 0.45, interval: float = 0.09) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if addresses_same_group(addresses):
+            return True
+        time.sleep(interval)
+    return addresses_same_group(addresses)
+
+
 def group_addresses(addresses: list[str]) -> bool:
     if len(addresses) < 2 or addresses_same_group(addresses):
         return True
 
     first = addresses[0]
     if len(window_group(first)) < 2:
-        hypr("dispatch", "focuswindow", f"address:{first}")
-        hypr("dispatch", "togglegroup")
-        time.sleep(0.15)
+        if not hypr("dispatch", "focuswindow", f"address:{first}", retries=2):
+            return False
+        if not hypr("dispatch", "togglegroup", retries=2):
+            return False
+        wait_for_same_group([first], timeout=0.12)
 
     # Hyprland's moveintogroup is directional. Restored windows are normally on
     # the same workspace, so try all directions and stop as soon as the target
@@ -1002,27 +1082,160 @@ def group_addresses(addresses: list[str]) -> bool:
     for address in addresses[1:]:
         if addresses_same_group([first, address]):
             continue
-        hypr("dispatch", "focuswindow", f"address:{address}")
+        if not hypr("dispatch", "focuswindow", f"address:{address}", retries=2):
+            return False
         for direction in ("l", "r", "u", "d"):
-            hypr("dispatch", "moveintogroup", direction)
-            time.sleep(0.15)
-            if addresses_same_group([first, address]):
+            if not hypr("dispatch", "moveintogroup", direction, retries=1):
+                continue
+            if wait_for_same_group([first, address], timeout=0.24):
                 break
-    return addresses_same_group(addresses)
+    return wait_for_same_group(addresses, timeout=0.45)
+
+
+def saved_group_addresses(targets: list[dict]) -> list[tuple[str, ...]]:
+    groups: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+    for win in targets:
+        grouped = tuple(a for a in (win.get("grouped") or []) if a)
+        if len(grouped) > 1 and grouped not in seen:
+            seen.add(grouped)
+            groups.append(grouped)
+    return groups
+
+
+def saved_window_by_address(targets: list[dict]) -> dict[str, dict]:
+    return {w.get("address") or "": w for w in targets if w.get("address")}
+
+
+def group_member_summaries(group: tuple[str, ...], by_address: dict[str, dict]) -> list[str]:
+    summaries = []
+    for address in group:
+        win = by_address.get(address)
+        summaries.append(window_summary(win) if win else f"saved address {address} (not in saved windows)")
+    return summaries
+
+
+def group_status_counts(assessments: list[dict], statuses: list[str]) -> Counter:
+    counts = Counter(a.get("status", "") for a in assessments)
+    for status in statuses:
+        counts.setdefault(status, 0)
+    return counts
+
+
+def assess_dry_run_groups(
+    targets: list[dict], current_windows: list[dict], planned_actions: dict[str, str]
+) -> list[dict]:
+    assigned = assign_current_addresses(targets, current_windows)
+    by_address = saved_window_by_address(targets)
+    assessments: list[dict] = []
+
+    for group in saved_group_addresses(targets):
+        missing_metadata = [a for a in group if a not in by_address]
+        actions = {a: planned_actions.get(a, "") for a in group if a in by_address}
+        missing_actions = [a for a in group if a in by_address and not actions.get(a)]
+        assigned_missing = [a for a in group if actions.get(a) == "already_open" and not assigned.get(a)]
+
+        if missing_metadata or missing_actions or assigned_missing:
+            status = "cannot_assess"
+        elif any(action == "skipped" for action in actions.values()):
+            status = "partial_missing"
+        elif all(action == "already_open" for action in actions.values()):
+            current_addresses = list(dict.fromkeys(assigned[a] for a in group if assigned.get(a)))
+            if len(current_addresses) == len(group) and addresses_same_group(current_addresses):
+                status = "already_correct"
+            else:
+                status = "would_regroup"
+        else:
+            status = "would_regroup"
+
+        assessments.append({
+            "group": group,
+            "status": status,
+            "members": group_member_summaries(group, by_address),
+            "missingMetadata": missing_metadata,
+            "missingActions": missing_actions,
+            "assignedMissing": assigned_missing,
+            "actions": actions,
+        })
+
+    return assessments
+
+
+def verify_saved_groups(targets: list[dict], assigned: dict[str, str]) -> list[dict]:
+    by_address = saved_window_by_address(targets)
+    assessments: list[dict] = []
+
+    for group in saved_group_addresses(targets):
+        missing_metadata = [a for a in group if a not in by_address]
+        current_addresses = list(dict.fromkeys(assigned[a] for a in group if assigned.get(a)))
+
+        if missing_metadata:
+            status = "cannot_assess"
+        elif len(current_addresses) < len(group):
+            status = "partial_missing"
+        elif addresses_same_group(current_addresses):
+            status = "correct"
+        else:
+            status = "failed"
+
+        assessments.append({
+            "group": group,
+            "status": status,
+            "members": group_member_summaries(group, by_address),
+            "missingMetadata": missing_metadata,
+            "currentAddresses": current_addresses,
+        })
+
+    return assessments
+
+
+def group_status_label(status: str) -> str:
+    return {
+        "already_correct": "already correct",
+        "would_regroup": "would regroup",
+        "partial_missing": "partial/missing",
+        "cannot_assess": "cannot assess",
+    }.get(status, status.replace("_", " "))
+
+
+def print_verbose_group_details(assessments: list[dict]) -> None:
+    if not VERBOSE or not assessments:
+        return
+    for index, assessment in enumerate(assessments, start=1):
+        print(
+            f"  group {index}: {group_status_label(assessment['status'])} "
+            f"({len(assessment['group'])} saved members)"
+        )
+        actions = assessment.get("actions") or {}
+        if actions:
+            action_counts = Counter(actions.values())
+            print(
+                f"    actions: already open {action_counts.get('already_open', 0)}, "
+                f"would launch {action_counts.get('would_launch', 0)}, "
+                f"skipped {action_counts.get('skipped', 0)}"
+            )
+        current_addresses = assessment.get("currentAddresses") or []
+        if current_addresses:
+            print(f"    current addresses: {', '.join(current_addresses)}")
+        missing = (
+            (assessment.get("missingMetadata") or [])
+            + (assessment.get("missingActions") or [])
+            + (assessment.get("assignedMissing") or [])
+        )
+        if missing:
+            print(f"    unresolved saved addresses: {', '.join(dict.fromkeys(missing))}")
+        for member in assessment.get("members", []):
+            print(f"    - {member}")
 
 
 def restore_groups(targets: list[dict]) -> tuple[int, dict[str, str]]:
     assigned = assign_current_addresses(targets)
-    grouped_targets: dict[tuple[str, ...], list[str]] = {}
-    for win in targets:
-        grouped = win.get("grouped") or []
-        if len(grouped) > 1:
-            grouped_targets.setdefault(tuple(grouped), grouped)
-    if not grouped_targets:
+    groups = saved_group_addresses(targets)
+    if not groups:
         return 0, assigned
 
     restored = 0
-    for saved_addresses in grouped_targets.values():
+    for saved_addresses in groups:
         current_addresses = [assigned[a] for a in saved_addresses if a in assigned]
         # Deduplicate while preserving saved group/tab order.
         current_addresses = list(dict.fromkeys(current_addresses))
@@ -1045,7 +1258,8 @@ def workspace_from_snapshot(snapshot: dict) -> str:
     return str(wid or "")
 
 
-def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str], fallback_active: dict) -> bool:
+def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str], fallback_active: dict) -> tuple[bool, bool]:
+    attempted = False
     active = data.get("activeWindow") or {}
     if active:
         saved_address = active.get("address") or ""
@@ -1058,8 +1272,9 @@ def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str
             except Exception:
                 pass
         if current_address:
-            hypr("dispatch", "focuswindow", f"address:{current_address}")
-            return True
+            attempted = True
+            if hypr("dispatch", "focuswindow", f"address:{current_address}", retries=2):
+                return True, attempted
 
         active_key = active.get("restoreKey") or ""
         if active_key:
@@ -1067,25 +1282,30 @@ def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str
                 if restore_key(win) == active_key:
                     address = win.get("address") or ""
                     if address:
-                        hypr("dispatch", "focuswindow", f"address:{address}")
-                        return True
+                        attempted = True
+                        if hypr("dispatch", "focuswindow", f"address:{address}", retries=2):
+                            return True, attempted
+                        break
 
         ws = workspace_from_snapshot(active)
         if ws:
-            hypr("dispatch", "workspace", ws)
-            return True
+            attempted = True
+            if hypr("dispatch", "workspace", ws, retries=2):
+                return True, attempted
 
     # Older session files did not record active focus. Preserve the user's
     # pre-restore focus in that case so restore does not yank them around.
     fallback_address = fallback_active.get("address") or ""
     if fallback_address:
-        hypr("dispatch", "focuswindow", f"address:{fallback_address}")
-        return True
+        attempted = True
+        if hypr("dispatch", "focuswindow", f"address:{fallback_address}", retries=2):
+            return True, attempted
     fallback_ws = workspace_from_snapshot(fallback_active)
     if fallback_ws:
-        hypr("dispatch", "workspace", fallback_ws)
-        return True
-    return False
+        attempted = True
+        if hypr("dispatch", "workspace", fallback_ws, retries=2):
+            return True, attempted
+    return False, attempted
 
 
 def enrich_legacy_terminal_targets(targets: list[dict]) -> None:
@@ -1207,24 +1427,26 @@ def launch_command(win: dict) -> tuple[list[str] | None, str]:
     return cmd, ""
 
 
-def launch(win: dict) -> bool:
+def launch_result(win: dict) -> str:
     cmd, skip_reason = launch_command(win)
     if not cmd:
         print(f"Skipping {skip_reason}", file=sys.stderr)
-        return False
+        return "skipped"
 
     ws = workspace_spec(win)
-    hypr_exec_on_workspace(cmd, ws)
-    return True
+    if hypr_exec_on_workspace(cmd, ws):
+        return "launched"
+    if VERBOSE:
+        print(f"Launch dispatch failed: {window_summary(win)} -> {shlex.join(cmd)}", file=sys.stderr)
+    return "dispatch_failed"
+
+
+def launch(win: dict) -> bool:
+    return launch_result(win) == "launched"
 
 
 def planned_group_count(targets: list[dict]) -> int:
-    grouped_targets: set[tuple[str, ...]] = set()
-    for win in targets:
-        grouped = tuple(win.get("grouped") or [])
-        if len(grouped) > 1:
-            grouped_targets.add(grouped)
-    return len(grouped_targets)
+    return len(saved_group_addresses(targets))
 
 
 def planned_focus_action(data: dict) -> str:
@@ -1256,12 +1478,12 @@ def restore_dry_run(path: Path) -> None:
     current_windows = collect_windows()
     current_counts = Counter(restore_key(w) for w in current_windows)
     monitor_moves = workspace_monitor_moves(targets)
-    group_count = planned_group_count(targets)
     launched = 0
     skipped_open = 0
     skipped_unknown = 0
+    planned_actions: dict[str, str] = {}
 
-    print(f"Restore dry-run for {path}")
+    print(f"Restore dry-run{f' for {human_path(path)}' if VERBOSE else ''}")
     print(f"Saved windows considered: {len(targets)}; current windows: {len(current_windows)}")
     if monitor_moves:
         print("Monitor actions:")
@@ -1276,10 +1498,13 @@ def restore_dry_run(path: Path) -> None:
     for win in targets:
         key = restore_key(win)
         label = window_summary(win)
+        address = win.get("address") or ""
         if current_counts[key] > 0:
             if not is_singleton(win):
                 current_counts[key] -= 1
             skipped_open += 1
+            if address:
+                planned_actions[address] = "already_open"
             print(f"  already open: {label}")
             continue
 
@@ -1288,18 +1513,41 @@ def restore_dry_run(path: Path) -> None:
             launched += 1
             if is_singleton(win) or is_webapp(win):
                 current_counts[key] += 1
+            if address:
+                planned_actions[address] = "would_launch"
             print(f"  would launch: {label} -> {shlex.join(cmd)}")
         else:
             skipped_unknown += 1
+            if address:
+                planned_actions[address] = "skipped"
             print(f"  skipped: {label} ({skip_reason})")
 
+    group_assessments = assess_dry_run_groups(targets, current_windows, planned_actions)
+    group_count = len(group_assessments)
     if group_count:
-        print(f"Group actions: would attempt to restore {group_count} saved group(s)")
+        counts = group_status_counts(group_assessments, ["already_correct", "would_regroup", "partial_missing", "cannot_assess"])
+        print(
+            "Group actions: "
+            f"{group_count} saved group(s): "
+            f"already correct {counts['already_correct']}, "
+            f"would regroup {counts['would_regroup']}, "
+            f"partial/missing {counts['partial_missing']}, "
+            f"cannot assess {counts['cannot_assess']}"
+        )
+        print_verbose_group_details(group_assessments)
     else:
         print("Group actions: none")
     print(f"Focus actions: {planned_focus_action(data)}")
     monitor_note = f", monitor placements {len(monitor_moves)}" if monitor_moves else ""
-    print(f"Dry-run checked {len(targets)} saved windows: would launch {launched}, already open {skipped_open}, skipped {skipped_unknown}, groups to restore {group_count}{monitor_note}")
+    if group_count:
+        group_summary = (
+            f", saved groups {group_count} "
+            f"(already correct {counts['already_correct']}, would regroup {counts['would_regroup']}, "
+            f"partial/missing {counts['partial_missing']}, cannot assess {counts['cannot_assess']})"
+        )
+    else:
+        group_summary = ", saved groups 0"
+    print(f"Dry-run checked {len(targets)} saved windows: would launch {launched}, already open {skipped_open}, skipped {skipped_unknown}{group_summary}{monitor_note}")
 
 
 def write_last_restore(source: Path, launched_windows: list[dict]) -> None:
@@ -1345,16 +1593,19 @@ def restore(path: Path, *, save_undo: bool = True) -> None:
 
     if save_undo:
         write_session(UNDO_FILE, quiet=True)
-        print(f"Stored pre-restore state at {UNDO_FILE}")
+        print(f"Stored pre-restore state{f' at {human_path(UNDO_FILE)}' if VERBOSE else ''}")
 
     fallback_active = active_window()
     current_windows = collect_windows()
     before_addresses = {w.get("address") or "" for w in current_windows}
     current_counts = Counter(restore_key(w) for w in current_windows)
-    monitors_restored = restore_workspace_monitors(targets)
+    monitors_restored, monitor_failures = restore_workspace_monitors(targets)
     launched = 0
     skipped_open = 0
     skipped_unknown = 0
+    launch_dispatch_failed = 0
+    launched_undetected = 0
+    state_dispatch_failed = 0
     groups_restored = 0
     launched_windows: list[dict] = []
 
@@ -1365,9 +1616,11 @@ def restore(path: Path, *, save_undo: bool = True) -> None:
                 current_counts[key] -= 1
             skipped_open += 1
             continue
-        if launch(win):
+        launch_status = launch_result(win)
+        if launch_status == "launched":
             launched += 1
-            address = apply_saved_state(win, before_addresses)
+            address, dispatch_failures = apply_saved_state(win, before_addresses)
+            state_dispatch_failed += dispatch_failures
             if address:
                 launched_windows.append({
                     "address": address,
@@ -1376,19 +1629,58 @@ def restore(path: Path, *, save_undo: bool = True) -> None:
                     "workspace": workspace_spec(win),
                     "restoreKey": restore_key(win),
                 })
+            else:
+                launched_undetected += 1
             if is_singleton(win) or is_webapp(win):
                 current_counts[key] += 1
             time.sleep(0.35)
+        elif launch_status == "dispatch_failed":
+            launch_dispatch_failed += 1
         else:
             skipped_unknown += 1
 
     groups_restored, assigned = restore_groups(targets)
-    focus_restored = restore_saved_focus(data, targets, assigned, fallback_active)
-    focus_note = ", focus restored" if focus_restored else ""
+    group_assessments = verify_saved_groups(targets, assigned)
+    group_count = len(group_assessments)
+    if group_count:
+        group_counts = group_status_counts(group_assessments, ["correct", "partial_missing", "failed", "cannot_assess"])
+        print_verbose_group_details(group_assessments)
+        group_note = (
+            f", groups actively restored {groups_restored}, "
+            f"groups verified correct {group_counts['correct']}/{group_count}, "
+            f"partial/missing {group_counts['partial_missing']}, "
+            f"failed {group_counts['failed']}, "
+            f"cannot assess {group_counts['cannot_assess']}"
+        )
+    else:
+        group_counts = Counter()
+        group_note = ", saved groups 0"
+    focus_restored, focus_attempted = restore_saved_focus(data, targets, assigned, fallback_active)
+    if focus_restored:
+        focus_note = ", focus restored"
+    elif focus_attempted:
+        focus_note = ", focus restore failed"
+    else:
+        focus_note = ""
     write_last_restore(path, launched_windows)
-    monitor_note = f", monitor placements {monitors_restored}" if monitors_restored else ""
-    print(f"Restore checked {len(targets)} saved windows: launched {launched}, already open {skipped_open}, skipped {skipped_unknown}, groups restored {groups_restored}{monitor_note}{focus_note}")
-    notify("Omarchy session restore", f"Launched {launched}; already open {skipped_open}; groups {groups_restored}")
+    monitor_parts = []
+    if monitors_restored:
+        monitor_parts.append(f"monitor placements {monitors_restored}")
+    if monitor_failures:
+        monitor_parts.append(f"monitor placement failures {monitor_failures}")
+    monitor_note = f", {', '.join(monitor_parts)}" if monitor_parts else ""
+    launch_note = ""
+    launch_issues = []
+    if launch_dispatch_failed:
+        launch_issues.append(f"launch dispatch failed {launch_dispatch_failed}")
+    if launched_undetected:
+        launch_issues.append(f"launched undetected {launched_undetected}")
+    if state_dispatch_failed:
+        launch_issues.append(f"state dispatch failures {state_dispatch_failed}")
+    if launch_issues:
+        launch_note = f", {', '.join(launch_issues)}"
+    print(f"Restore checked {len(targets)} saved windows: launched {launched}, already open {skipped_open}, skipped {skipped_unknown}{launch_note}{group_note}{monitor_note}{focus_note}")
+    notify("Omarchy session restore", f"Launched {launched}; already open {skipped_open}; groups correct {group_counts.get('correct', 0)}/{group_count}")
 
 
 def session_choices() -> list[tuple[str, Path]]:
@@ -1407,7 +1699,11 @@ def session_choices() -> list[tuple[str, Path]]:
 
 def list_profiles() -> None:
     for label, path in session_choices():
-        print(f"{label}\t{path}")
+        summary = session_file_summary(path)
+        if VERBOSE:
+            print(f"{label}\t{summary}\t{human_path(path)}")
+        else:
+            print(f"{label}: {summary}")
 
 
 def run_menu(labels: list[str], prompt: str) -> str:
@@ -1591,16 +1887,20 @@ def list_session(path: Path = SESSION_FILE) -> None:
     active_line = ""
     if active:
         active_line = f"Active: workspace {workspace_from_snapshot(active)} — {active.get('class')} — {active.get('title')}\n"
-    print(f"Saved: {data.get('savedAt')}\nFile: {path}\n{active_line}")
+    file_line = f"File: {human_path(path)}\n" if VERBOSE else ""
+    saved_line = f"Saved: {file_age(path)}"
+    if VERBOSE and data.get("savedAt"):
+        saved_line += f" ({data.get('savedAt')})"
+    print(f"{saved_line}\n{file_line}{active_line}")
     for w in data.get("windows", []):
         ws = workspace_spec(w)
         webapp_url, _ = browser_app_args(w)
-        suffix = f" [{w.get('restoreWorkdir')}]" if w.get("restoreWorkdir") else ""
-        if w.get("restoreArgv"):
+        suffix = f" [{human_path(w.get('restoreWorkdir'))}]" if VERBOSE and w.get("restoreWorkdir") else ""
+        if VERBOSE and w.get("restoreArgv"):
             suffix += f" [restore: {shlex.join(w.get('restoreArgv') or [])}]"
-        if w.get("agentSession"):
+        if VERBOSE and w.get("agentSession"):
             agent = w.get("agentSession") or {}
-            suffix += f" [session: {agent.get('tool')} {agent.get('id')}]"
+            suffix += f" [session: {agent.get('tool')} {human_path(agent.get('id') or '')}]"
         if (w.get("groupSize") or 0) > 1:
             suffix += f" [group tab {int(w.get('groupIndex') or 0) + 1}/{w.get('groupSize')}]"
         if w.get("monitorName"):
@@ -1612,7 +1912,10 @@ def list_session(path: Path = SESSION_FILE) -> None:
 
 def usage() -> None:
     prog = Path(sys.argv[0]).name
-    print(f"""Usage: {prog} <command> [name]
+    print(f"""Usage: {prog} [-v|--verbose] <command> [name]
+
+Options:
+  -v, --verbose  include saved file paths and restore metadata
 
 Short commands:
   s [name]    save
@@ -1634,11 +1937,22 @@ Full commands still work:
 Current shortcuts:
 {shortcuts_help_block()}
 
-Files:
-  default:   {SESSION_FILE}
-  named:     {PROFILE_DIR}
-  autosaves: {AUTOSAVE_DIR}  (keeps latest {AUTOSAVE_KEEP})
+Files (shown in normal command output only with -v):
+  default:   {human_path(SESSION_FILE)}
+  named:     {human_path(PROFILE_DIR)}
+  autosaves: {human_path(AUTOSAVE_DIR)}  (keeps latest {AUTOSAVE_KEEP})
 """)
+
+
+def parse_global_flags(args: list[str]) -> list[str]:
+    global VERBOSE
+    parsed: list[str] = []
+    for arg in args:
+        if arg in {"--verbose", "-v"}:
+            VERBOSE = True
+        else:
+            parsed.append(arg)
+    return parsed
 
 
 def parse_name_and_restore_flags(args: list[str]) -> tuple[str | None, bool]:
@@ -1661,7 +1975,7 @@ def parse_name_and_restore_flags(args: list[str]) -> tuple[str | None, bool]:
 
 
 def main() -> None:
-    args = sys.argv[1:]
+    args = parse_global_flags(sys.argv[1:])
     cmd = args[0] if args else ""
     rest = args[1:] if args else []
     aliases = {
@@ -1682,8 +1996,9 @@ def main() -> None:
     if cmd == "save":
         write_session(session_path(name))
     elif cmd == "autosave":
-        path = autosave_once()
-        print(f"Autosave: {path}")
+        path = autosave_once(quiet=True)
+        target = f" ({human_path(path)})" if VERBOSE else ""
+        print(f"Autosaved {session_file_summary(path)}{target}")
     elif cmd == "autosave-loop":
         autosave_loop()
     elif cmd in {"restore", "start"}:

@@ -41,6 +41,7 @@ ws u              # soft undo: restore the pre-restore snapshot
 ws uh             # hard undo: close windows launched by the last restore
 ws st             # status/health
 ws deps           # dependency check
+ws -v l           # verbose output with saved paths/restore metadata
 ```
 
 ## Privacy and saved state
@@ -50,6 +51,8 @@ Runtime state lives in:
 ```text
 ~/.local/state/omarchy-session/
 ```
+
+Normal command output is summary-first: it shows counts and relative ages like `12m ago`, and avoids full saved-state paths/raw timestamps unless you pass `-v` / `--verbose` or explicitly run `ws path`.
 
 By default that directory contains the latest save (`last-session.json`), named
 profiles (`profiles/*.json`), autosaves (`autosaves/*.json`), the soft-undo

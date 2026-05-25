@@ -102,9 +102,95 @@ class DryRunTests(unittest.TestCase):
             self.assertIn("skipped: workspace 3: obsidian", text)
             self.assertIn("missing command for obsidian: obsidian", text)
             self.assertIn("Monitor actions:", text)
-            self.assertIn("Group actions: would attempt to restore 1 saved group", text)
+            self.assertIn("Group actions: 1 saved group(s):", text)
+            self.assertIn("partial/missing 1", text)
             self.assertIn("Focus actions: would focus saved active window", text)
             self.assertIn("would launch 1, already open 1, skipped 2", text)
+            self.assertIn("saved groups 1", text)
+
+    def test_group_verification_reports_correct_partial_failed_and_unassessable(self):
+        mod = load_module()
+        targets = [
+            {"address": "0x1", "class": "ghostty", "title": "A", "workspace": {"id": 1, "name": "1"}, "grouped": ["0x1", "0x2"]},
+            {"address": "0x2", "class": "ghostty", "title": "B", "workspace": {"id": 1, "name": "1"}, "grouped": ["0x1", "0x2"]},
+            {"address": "0x3", "class": "ghostty", "title": "C", "workspace": {"id": 2, "name": "2"}, "grouped": ["0x3", "0x4"]},
+            {"address": "0x4", "class": "ghostty", "title": "D", "workspace": {"id": 2, "name": "2"}, "grouped": ["0x3", "0x4"]},
+            {"address": "0x5", "class": "ghostty", "title": "E", "workspace": {"id": 3, "name": "3"}, "grouped": ["0x5", "0x6"]},
+            {"address": "0x6", "class": "ghostty", "title": "F", "workspace": {"id": 3, "name": "3"}, "grouped": ["0x5", "0x6"]},
+            {"address": "0x7", "class": "ghostty", "title": "G", "workspace": {"id": 4, "name": "4"}, "grouped": ["0x7", "0x8"]},
+        ]
+        assigned = {
+            "0x1": "0xc1",
+            "0x2": "0xc2",
+            "0x3": "0xc3",
+            "0x4": "0xc4",
+            "0x5": "0xc5",
+            "0x7": "0xc7",
+        }
+        mod.raw_clients = lambda: [
+            {"address": "0xc1", "grouped": ["0xc1", "0xc2"]},
+            {"address": "0xc2", "grouped": ["0xc1", "0xc2"]},
+            {"address": "0xc3", "grouped": ["0xc3"]},
+            {"address": "0xc4", "grouped": ["0xc4"]},
+            {"address": "0xc5", "grouped": ["0xc5"]},
+            {"address": "0xc7", "grouped": ["0xc7"]},
+        ]
+
+        assessments = mod.verify_saved_groups(targets, assigned)
+        counts = mod.group_status_counts(assessments, ["correct", "partial_missing", "failed", "cannot_assess"])
+
+        self.assertEqual(counts["correct"], 1)
+        self.assertEqual(counts["partial_missing"], 1)
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(counts["cannot_assess"], 1)
+
+    def test_hypr_retries_transient_dispatch_failure(self):
+        mod = load_module()
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0 if len(calls) == 2 else 1)
+
+        with mock.patch.object(mod.subprocess, "run", fake_run):
+            with mock.patch.object(mod.time, "sleep", lambda delay: None):
+                self.assertTrue(mod.hypr("dispatch", "workspace", "1", retries=1))
+
+        self.assertEqual(len(calls), 2)
+
+    def test_restore_summary_reports_launch_detection_and_dispatch_failures(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp) / "session.json"
+            session.write_text(json.dumps({
+                "windows": [
+                    {"address": "0x1", "class": "alacritty", "workspace": {"id": 1, "name": "1"}},
+                    {"address": "0x2", "class": "alacritty", "workspace": {"id": 2, "name": "2"}},
+                ],
+            }))
+            launch_statuses = iter(["launched", "dispatch_failed"])
+            mod.collect_windows = lambda: []
+            mod.active_window = lambda: {}
+            mod.restore_workspace_monitors = lambda targets: (0, 1)
+            mod.launch_result = lambda win: next(launch_statuses)
+            mod.apply_saved_state = lambda win, before_addresses: ("", 1)
+            mod.restore_groups = lambda targets: (0, {})
+            mod.verify_saved_groups = lambda targets, assigned: []
+            mod.restore_saved_focus = lambda data, targets, assigned, fallback: (False, True)
+            mod.write_last_restore = lambda path, launched: None
+            mod.notify = lambda title, body="": None
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                mod.restore(session, save_undo=False)
+
+            text = out.getvalue()
+            self.assertIn("launched 1", text)
+            self.assertIn("launch dispatch failed 1", text)
+            self.assertIn("launched undetected 1", text)
+            self.assertIn("state dispatch failures 1", text)
+            self.assertIn("monitor placement failures 1", text)
+            self.assertIn("focus restore failed", text)
 
     def test_restore_dry_run_cli_forms(self):
         mod = load_module()
