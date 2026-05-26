@@ -143,6 +143,10 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(counts["partial_missing"], 1)
         self.assertEqual(counts["failed"], 1)
         self.assertEqual(counts["cannot_assess"], 1)
+        failed = next(a for a in assessments if a["status"] == "failed")
+        self.assertEqual(failed["presentButNotGrouped"], ["0xc3", "0xc4"])
+        partial = next(a for a in assessments if a["status"] == "partial_missing")
+        self.assertEqual(partial["missingSavedAddresses"], ["0x6"])
 
     def test_hypr_retries_transient_dispatch_failure(self):
         mod = load_module()
@@ -272,6 +276,64 @@ class DryRunTests(unittest.TestCase):
             self.assertEqual(audit["verification"]["extraNewWindowCount"], 1)
             self.assertTrue(audit["verification"]["matchedWellEnough"])
             self.assertEqual(audit["launched"][0]["address"], "0xc2")
+            self.assertEqual([o["status"] for o in audit["targetOutcomes"]], ["already_open", "launched_detected"])
+            self.assertEqual(audit["targetOutcomes"][1]["currentAddress"], "0xc2")
+
+    def test_duplicate_singleton_targets_are_reported_as_restore_limitations(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            session = tmp_path / "session.json"
+            session.write_text(json.dumps({
+                "windows": [
+                    {"address": "0x1", "class": "firefox", "title": "First", "workspace": {"id": 1, "name": "1"}},
+                    {"address": "0x2", "class": "firefox", "title": "Second", "workspace": {"id": 2, "name": "2"}},
+                ],
+            }))
+            before_windows = [{"address": "0xc1", "class": "firefox", "title": "First", "workspace": {"id": 1, "name": "1"}}]
+            collections = iter([before_windows, before_windows])
+            mod.collect_windows = lambda: next(collections)
+            mod.active_window = lambda: {}
+            mod.restore_workspace_monitors = lambda targets: (0, 0)
+            mod.launch_result = lambda win: self.fail("duplicate singleton should not launch")
+            mod.restore_groups = lambda targets: (0, {})
+            mod.verify_saved_groups = lambda targets, assigned: []
+            mod.restore_saved_focus = lambda data, targets, assigned, fallback: (False, False)
+            mod.notify = lambda title, body="": None
+            mod.LAST_RESTORE_FILE = tmp_path / "last-restore.json"
+            mod.LAST_RESTORE_AUDIT_FILE = tmp_path / "last-restore-audit.json"
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                mod.restore(session, save_undo=False)
+
+            text = out.getvalue()
+            self.assertIn("duplicate singleton unsupported 1", text)
+            self.assertIn("restore needs review", text)
+            audit = json.loads(mod.LAST_RESTORE_AUDIT_FILE.read_text())
+            self.assertEqual([o["status"] for o in audit["targetOutcomes"]], ["already_open", "duplicate_singleton_unsupported"])
+            self.assertEqual(audit["summary"]["duplicateSingletonUnsupported"], 1)
+            self.assertEqual(audit["verification"]["missingCount"], 0)
+            self.assertEqual(audit["verification"]["unsupportedDuplicateSingletonCount"], 1)
+            self.assertFalse(audit["verification"]["matchedWellEnough"])
+
+    def test_restore_review_note_reports_verification_failures(self):
+        mod = load_module()
+        note = mod.restore_review_note({
+            "matchedWellEnough": False,
+            "missingCount": 1,
+            "unsupportedDuplicateSingletonCount": 2,
+            "workspaceMismatchCount": 0,
+            "monitorMismatchCount": 1,
+            "groups": {"counts": {"partial_missing": 1, "failed": 2, "cannot_assess": 0}},
+            "focus": {"failed": True},
+        })
+        self.assertIn("restore needs review", note)
+        self.assertIn("missing 1", note)
+        self.assertIn("duplicate singleton unsupported 2", note)
+        self.assertIn("monitor mismatches 1", note)
+        self.assertIn("group failed 2", note)
+        self.assertIn("focus failed", note)
 
     def test_restore_dry_run_cli_forms(self):
         mod = load_module()

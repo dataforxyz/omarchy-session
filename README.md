@@ -52,7 +52,7 @@ Runtime state lives in:
 ~/.local/state/omarchy-session/
 ```
 
-Normal command output is summary-first: it shows counts and relative ages like `12m ago`, and avoids full saved-state paths/raw timestamps unless you pass `-v` / `--verbose` or explicitly run `ws path`.
+Normal command output is summary-first: it shows counts and relative ages like `12m ago`, and avoids full saved-state paths/raw timestamps unless you pass `-v` / `--verbose` or explicitly run `ws path`. Real restores append `restore needs review` when the after-restore audit finds missing targets, singleton/browser limitations, group failures, mismatches, or focus failures.
 
 By default that directory contains the latest save (`last-session.json`), named
 profiles (`profiles/*.json`), autosaves (`autosaves/*.json`), the soft-undo

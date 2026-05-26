@@ -94,18 +94,28 @@ back safely when monitor names changed after a reinstall, dock change, or laptop
 undock. Restore-time Hyprland dispatches are retried briefly when possible, and
 the final summary reports detectable launch dispatch failures, launched windows
 that were not observed, saved-state dispatch failures, monitor placement failures,
-and focus restore failures.
+and focus restore failures. If post-restore verification is not clean, normal
+output includes `restore needs review` with concise missing/mismatch/group/focus
+counts instead of hiding the partial restore in the JSON audit.
 
 Before each restore, the current layout is saved to a soft-undo snapshot used by
 `ws u`. Restore also records the addresses of windows it actually launched in
 `last-restore.json`; `ws undo-hard` closes only those launched windows that are
 still present, leaving pre-existing windows alone. Each real restore also writes
 `last-restore-audit.json`, containing the before snapshot, intended targets,
-after snapshot, launched window records, restore summary counters, and a
-verification section with matched/missing targets, extra new windows,
-workspace/monitor mismatches where detectable, group verification details, and
-focus outcome. Normal restore output only notes that the audit was saved; use
-`-v` to show the audit path.
+after snapshot, launched window records, per-target restore outcomes, restore
+summary counters, and a verification section with matched/missing targets, extra
+new windows, workspace/monitor mismatches where detectable, group verification
+details, and focus outcome. Normal restore output only notes that the audit was
+saved; use `-v` to show the audit path.
+
+Plain singleton app targets such as normal Firefox or Chromium windows are a
+known limitation: launching those apps can reuse an existing process, window, or
+tab, so multiple saved plain-browser windows with the same singleton restore key
+cannot be restored as independent Hyprland windows reliably. Duplicate singleton
+targets are now marked as `duplicate_singleton_unsupported` in the audit and are
+included in the `restore needs review` summary instead of being counted as if they
+were independently restored.
 
 Terminal restore behavior is best effort:
 
