@@ -19,6 +19,7 @@ SESSION_FILE = STATE_DIR / "last-session.json"
 UNDO_FILE = STATE_DIR / "before-last-restore.json"
 LAST_RESTORE_FILE = STATE_DIR / "last-restore.json"
 LAST_RESTORE_AUDIT_FILE = STATE_DIR / "last-restore-audit.json"
+UNKNOWN_CLASSES_FILE = STATE_DIR / "unknown-classes.json"
 AUTOSAVE_DIR = STATE_DIR / "autosaves"
 LATEST_AUTOSAVE = AUTOSAVE_DIR / "latest.json"
 PROFILE_DIR = STATE_DIR / "profiles"
@@ -38,8 +39,9 @@ EXCLUDED_CLASSES = {"zenity", "pinentry", "org.gnome.polkit", "xdg-desktop-porta
 SINGLETON_CLASSES = {
     "chromium", "chromium-browser", "brave-browser", "brave",
     "google-chrome", "google-chrome-stable", "firefox", "firefoxdeveloperedition",
+    "zen", "zen-browser", "zen-twilight", "app.zen_browser.zen",
     "slack", "discord", "signal", "signal-desktop", "obsidian", "thunderbird", "keepassxc",
-    "org.keepassxc.keepassxc",
+    "org.keepassxc.keepassxc", "telegram-desktop", "org.telegram.desktop",
 }
 TERMINAL_CLASSES = {"com.mitchellh.ghostty", "ghostty", "alacritty"}
 REQUIRED_COMMANDS = ("hyprctl",)
@@ -51,8 +53,8 @@ OPTIONAL_COMMAND_GROUPS = {
     "pick menu": ("walker", "wofi", "fuzzel", "rofi"),
     "web apps": ("omarchy-launch-webapp",),
     "app restore targets": (
-        "chromium", "brave", "google-chrome-stable", "firefox", "obsidian", "slack",
-        "discord", "signal-desktop", "nautilus", "thunderbird", "keepassxc", "code",
+        "chromium", "brave", "google-chrome-stable", "firefox", "zen-browser", "obsidian", "slack",
+        "discord", "signal-desktop", "Telegram", "telegram-desktop", "nautilus", "thunderbird", "keepassxc", "code",
     ),
     "agent resume helpers": ("pi", "claude", "clo", "clod", "cloc", "codex", "opencode"),
 }
@@ -608,6 +610,19 @@ def session_summary(windows: list[dict]) -> str:
     return ", ".join(parts)
 
 
+def compact_session_summary(windows: list[dict]) -> str:
+    workspaces = {workspace_spec(w) for w in windows if workspace_spec(w) != "0"}
+    grouped = {tuple(w.get("grouped") or []) for w in windows if len(w.get("grouped") or []) > 1}
+    terminal_resumes = sum(
+        1 for w in windows
+        if lc_class(w) in TERMINAL_CLASSES and (w.get("restoreArgv") or (w.get("agentSession") or {}).get("id"))
+    )
+    parts = [f"w{len(windows)}", f"ws{len(workspaces)}", f"g{len(grouped)}"]
+    if terminal_resumes:
+        parts.append(f"t{terminal_resumes}")
+    return " ".join(parts)
+
+
 def session_file_summary(path: Path) -> str:
     if not path.exists() and not path.is_symlink():
         return "missing"
@@ -616,6 +631,120 @@ def session_file_summary(path: Path) -> str:
         return f"{session_summary(data.get('windows', []))}, {file_age(path)}"
     except Exception:
         return "unreadable"
+
+
+def session_picker_summary(path: Path) -> str:
+    if not path.exists() and not path.is_symlink():
+        return "missing"
+    try:
+        data = json.loads(path.read_text())
+        return f"{compact_session_summary(data.get('windows', []))}, {file_age(path)}"
+    except Exception:
+        return "unreadable"
+
+
+def unknown_class_key(win: dict) -> str:
+    return lc_class(win) or "(empty)"
+
+
+def is_unknown_app_reason(reason: str) -> bool:
+    return reason.startswith("unknown app class:")
+
+
+def unknown_class_example(win: dict, source: Path | None = None) -> dict:
+    example = {
+        "seenAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "class": win.get("class") or "",
+        "title": win.get("title") or "",
+        "workspace": workspace_spec(win),
+        "monitorName": win.get("monitorName") or "",
+        "restoreKey": restore_key(win),
+    }
+    if win.get("restoreWorkdir"):
+        example["restoreWorkdir"] = win.get("restoreWorkdir")
+    if source:
+        example["source"] = str(source)
+    return example
+
+
+def read_unknown_classes_log() -> dict:
+    if not UNKNOWN_CLASSES_FILE.exists():
+        return {"classes": {}}
+    try:
+        data = json.loads(UNKNOWN_CLASSES_FILE.read_text())
+        if not isinstance(data, dict):
+            return {"classes": {}}
+        classes = data.get("classes")
+        if not isinstance(classes, dict):
+            data["classes"] = {}
+        return data
+    except Exception:
+        return {"classes": {}}
+
+
+def write_unknown_classes_log(data: dict) -> None:
+    UNKNOWN_CLASSES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = UNKNOWN_CLASSES_FILE.with_suffix(UNKNOWN_CLASSES_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(UNKNOWN_CLASSES_FILE)
+
+
+def log_unknown_app_class(win: dict, source: Path | None = None) -> None:
+    key = unknown_class_key(win)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    data = read_unknown_classes_log()
+    data["updatedAt"] = now
+    classes = data.setdefault("classes", {})
+    group = classes.setdefault(key, {
+        "class": win.get("class") or "",
+        "count": 0,
+        "firstSeenAt": now,
+        "lastSeenAt": now,
+        "examples": [],
+    })
+    group["class"] = group.get("class") or win.get("class") or ""
+    group["count"] = int(group.get("count") or 0) + 1
+    group.setdefault("firstSeenAt", now)
+    group["lastSeenAt"] = now
+
+    examples = [item for item in (group.get("examples") or []) if isinstance(item, dict)]
+    example = unknown_class_example(win, source)
+    signature = (example.get("title"), example.get("workspace"), example.get("restoreWorkdir"))
+    examples = [
+        item for item in examples
+        if (item.get("title"), item.get("workspace"), item.get("restoreWorkdir")) != signature
+    ]
+    examples.insert(0, example)
+    group["examples"] = examples[:8]
+    write_unknown_classes_log(data)
+
+
+def unknown_classes_summary() -> str:
+    data = read_unknown_classes_log()
+    classes = data.get("classes") or {}
+    if not classes:
+        return "none"
+    total = sum(int(group.get("count") or 0) for group in classes.values() if isinstance(group, dict))
+    return f"{len(classes)} class(es), {total} occurrence(s), {file_age(UNKNOWN_CLASSES_FILE)}"
+
+
+def list_unknown_classes() -> None:
+    data = read_unknown_classes_log()
+    classes = data.get("classes") or {}
+    if not classes:
+        print(f"No unknown app classes logged at {human_path(UNKNOWN_CLASSES_FILE)}")
+        return
+    print(f"Unknown app classes: {unknown_classes_summary()}")
+    for key, group in sorted(classes.items(), key=lambda item: (-int((item[1] or {}).get("count") or 0), item[0])):
+        if not isinstance(group, dict):
+            continue
+        label = group.get("class") or key
+        print(f"{label}: {int(group.get('count') or 0)} occurrence(s), last seen {group.get('lastSeenAt') or 'unknown'}")
+        for example in group.get("examples") or []:
+            title = example.get("title") or "(untitled)"
+            workspace = example.get("workspace") or "?"
+            source = f" [{human_path(example.get('source'))}]" if VERBOSE and example.get("source") else ""
+            print(f"  workspace {workspace}: {title}{source}")
 
 
 def write_session(path: Path, *, quiet: bool = False) -> None:
@@ -891,6 +1020,13 @@ def uwsm_cmd(cmd: list[str]) -> list[str]:
     return cmd
 
 
+def first_available_command(commands: list[str]) -> str:
+    for command in commands:
+        if shutil.which(command):
+            return command
+    return commands[0] if commands else ""
+
+
 def hypr(*args: str, retries: int = 1, delay: float = 0.08) -> bool:
     for attempt in range(retries + 1):
         try:
@@ -953,16 +1089,72 @@ def restore_workspace_monitors(targets: list[dict]) -> tuple[int, int]:
     return moved, failed
 
 
+def compatible_current_window(target: dict, candidate: dict) -> bool:
+    if restore_key(candidate) == restore_key(target):
+        return True
+    if lc_class(candidate) != lc_class(target):
+        return False
+
+    target_title = target.get("title") or ""
+    candidate_title = candidate.get("title") or ""
+    if target_title and candidate_title and target_title == candidate_title:
+        return True
+
+    target_url, target_flags = browser_app_args(target)
+    candidate_url, candidate_flags = browser_app_args(candidate)
+    if target_url and candidate_url and target_url == candidate_url and target_flags == candidate_flags:
+        return True
+
+    target_workdir = target.get("restoreWorkdir") or ""
+    candidate_workdir = candidate.get("restoreWorkdir") or ""
+    if lc_class(target) in TERMINAL_CLASSES and target_workdir and target_workdir == candidate_workdir:
+        return True
+
+    return is_singleton(target)
+
+
+def candidate_match_score(target: dict, candidate: dict) -> int:
+    if restore_key(candidate) == restore_key(target):
+        return 100
+    if lc_class(candidate) != lc_class(target):
+        return 0
+
+    target_title = target.get("title") or ""
+    candidate_title = candidate.get("title") or ""
+    if target_title and candidate_title and target_title == candidate_title:
+        return 90
+
+    target_url, target_flags = browser_app_args(target)
+    candidate_url, candidate_flags = browser_app_args(candidate)
+    if target_url and candidate_url and target_url == candidate_url and target_flags == candidate_flags:
+        return 85
+
+    target_workdir = target.get("restoreWorkdir") or ""
+    candidate_workdir = candidate.get("restoreWorkdir") or ""
+    if lc_class(target) in TERMINAL_CLASSES and target_workdir and target_workdir == candidate_workdir:
+        return 75
+
+    if is_singleton(target):
+        return 60
+    return 0
+
+
 def find_new_window(target: dict, before_addresses: set[str], timeout: float = 6.0) -> dict | None:
     deadline = time.time() + timeout
-    target_key = restore_key(target)
     while time.time() < deadline:
         try:
-            for win in collect_windows():
-                if (win.get("address") or "") in before_addresses:
-                    continue
-                if restore_key(win) == target_key or lc_class(win) == lc_class(target):
-                    return win
+            candidates = [
+                win for win in collect_windows()
+                if (win.get("address") or "") not in before_addresses
+            ]
+            scored = [
+                (candidate_match_score(target, win), win)
+                for win in candidates
+            ]
+            scored = [(score, win) for score, win in scored if score > 0]
+            if scored:
+                scored.sort(key=lambda item: item[0], reverse=True)
+                return scored[0][1]
         except Exception:
             pass
         time.sleep(0.2)
@@ -984,6 +1176,9 @@ def apply_saved_state(target: dict, before_addresses: set[str]) -> tuple[str, in
         if not hypr("dispatch", "movetoworkspacesilent", f"{ws},address:{address}", retries=2):
             failed_dispatches += 1
         return address, failed_dispatches
+
+    if not hypr("dispatch", "movetoworkspacesilent", f"{ws},address:{address}", retries=2):
+        failed_dispatches += 1
 
     # Best-effort: geometry restore is useful mostly for floating windows. Tiled
     # windows are intentionally left to Hyprland's layout. Avoid focuswindow here
@@ -1029,7 +1224,21 @@ def addresses_same_group(addresses: list[str]) -> bool:
     return False
 
 
-def assign_current_addresses(targets: list[dict], current: list[dict] | None = None) -> dict[str, str]:
+def current_addresses_from_outcomes(target_outcomes: list[dict] | None) -> dict[str, str]:
+    addresses: dict[str, str] = {}
+    for outcome in target_outcomes or []:
+        saved_address = outcome.get("savedAddress") or ""
+        current_address = outcome.get("currentAddress") or ""
+        if saved_address and current_address:
+            addresses[saved_address] = current_address
+    return addresses
+
+
+def assign_current_addresses(
+    targets: list[dict],
+    current: list[dict] | None = None,
+    preferred: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Map saved Hyprland addresses to current ones after restore.
 
     Addresses change after reboot, so this uses stable restore keys and then
@@ -1042,9 +1251,30 @@ def assign_current_addresses(targets: list[dict], current: list[dict] | None = N
     assigned: dict[str, str] = {}
 
     current_by_address = {w.get("address"): w for w in current if w.get("address")}
+    targets_by_saved_address = saved_window_by_address(targets)
+
+    for saved_address, current_address in (preferred or {}).items():
+        target = targets_by_saved_address.get(saved_address)
+        candidate = current_by_address.get(current_address)
+        if (
+            target
+            and candidate
+            and current_address not in used
+            and compatible_current_window(target, candidate)
+        ):
+            assigned[saved_address] = current_address
+            used.add(current_address)
+
     for target in targets:
         saved_address = target.get("address") or ""
-        if saved_address and saved_address in current_by_address and saved_address not in used:
+        candidate = current_by_address.get(saved_address)
+        if (
+            saved_address
+            and saved_address not in assigned
+            and candidate
+            and saved_address not in used
+            and compatible_current_window(target, candidate)
+        ):
             assigned[saved_address] = saved_address
             used.add(saved_address)
 
@@ -1077,47 +1307,98 @@ def assign_current_addresses(targets: list[dict], current: list[dict] | None = N
     return assigned
 
 
-def wait_for_same_group(addresses: list[str], timeout: float = 0.45, interval: float = 0.09) -> bool:
+# Grouping windows back into Hyprland tab groups is inherently racy: each
+# dispatch is asynchronous and `moveintogroup` only works toward a window that is
+# spatially adjacent *right now*. These knobs trade a little restore latency for
+# reliability — they are deliberately generous because a missed group is far more
+# annoying than a few hundred milliseconds.
+GROUP_SETTLE = 0.12          # let one dispatch take effect before re-reading state
+GROUP_HEAD_TIMEOUT = 0.40    # max wait for a lone window to become a group head
+GROUP_JOIN_TIMEOUT = 0.30    # max wait for one window to join the head's group
+GROUP_PASSES = 4             # full sweeps over still-ungrouped members
+
+
+def wait_until(predicate, timeout: float, interval: float = 0.05) -> bool:
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        if addresses_same_group(addresses):
+    while True:
+        if predicate():
             return True
+        if time.time() >= deadline:
+            return False
         time.sleep(interval)
-    return addresses_same_group(addresses)
+
+
+def wait_for_same_group(addresses: list[str], timeout: float = 0.45, interval: float = 0.05) -> bool:
+    return wait_until(lambda: addresses_same_group(addresses), timeout, interval)
+
+
+def window_in_group(address: str) -> bool:
+    """True when Hyprland reports the window as part of any group.
+
+    A lone window toggled into a group still lists itself in `grouped`, so a
+    non-empty list reliably means "this window can accept moveintogroup".
+    """
+    return bool(window_group(address))
+
+
+def ensure_group_head(address: str) -> bool:
+    """Toggle a lone window into a group so others can be moved into it.
+
+    Retries the toggle: a single `togglegroup` dispatch can be dropped while the
+    window is still settling, and the old code never confirmed it took effect
+    (its wait used a single address, which is trivially "already grouped").
+    """
+    if window_in_group(address):
+        return True
+    for _ in range(3):
+        if not hypr("dispatch", "focuswindow", f"address:{address}", retries=2):
+            return window_in_group(address)
+        hypr("dispatch", "togglegroup", retries=2)
+        if wait_until(lambda: window_in_group(address), GROUP_HEAD_TIMEOUT):
+            return True
+    return window_in_group(address)
+
+
+def move_into_group(head: str, address: str) -> bool:
+    """Best-effort: focus `address` and slide it into `head`'s group from any side.
+
+    `moveintogroup` is directional and relative to the focused window, so we
+    sweep all four directions and confirm membership after each. Focus is given a
+    moment to settle first, otherwise the directional move reads stale adjacency.
+    """
+    if addresses_same_group([head, address]):
+        return True
+    if not hypr("dispatch", "focuswindow", f"address:{address}", retries=2):
+        return False
+    time.sleep(GROUP_SETTLE)
+    for direction in ("l", "r", "u", "d"):
+        if not hypr("dispatch", "moveintogroup", direction, retries=1):
+            continue
+        if wait_until(lambda: addresses_same_group([head, address]), GROUP_JOIN_TIMEOUT):
+            return True
+    return addresses_same_group([head, address])
 
 
 def group_addresses(addresses: list[str]) -> bool:
+    addresses = list(dict.fromkeys(a for a in addresses if a))
     if len(addresses) < 2 or addresses_same_group(addresses):
         return True
 
-    first = addresses[0]
-    if len(window_group(first)) < 2:
-        if not hypr("dispatch", "focuswindow", f"address:{first}", retries=2):
-            return False
-        if not hypr("dispatch", "togglegroup", retries=2):
-            return False
-        wait_for_same_group([first], timeout=0.12)
+    head, members = addresses[0], addresses[1:]
+    if not ensure_group_head(head):
+        return addresses_same_group(addresses)
 
-    # Hyprland's moveintogroup is directional. Restored windows are normally on
-    # the same workspace, so try all directions and stop as soon as the target
-    # joins the first window's group. This is best-effort and leaves focus
-    # restored by restore_groups().
-    for attempt in range(2):
-        for address in addresses[1:]:
-            if addresses_same_group([first, address]):
-                continue
-            if not hypr("dispatch", "focuswindow", f"address:{address}", retries=2):
-                return False
-            for direction in ("l", "r", "u", "d"):
-                if not hypr("dispatch", "moveintogroup", direction, retries=1):
-                    continue
-                if wait_for_same_group([first, address], timeout=0.24):
-                    break
-        if wait_for_same_group(addresses, timeout=0.45):
+    # Repeated passes over only the windows that have not joined yet. A transient
+    # focus/dispatch failure on one member no longer aborts the whole group; it is
+    # simply retried on the next pass, and the layout may have shifted enough by
+    # then for a previously non-adjacent window to slide in.
+    pending = list(members)
+    for _ in range(GROUP_PASSES):
+        pending = [a for a in pending if not move_into_group(head, a)]
+        if not pending:
             return True
-        if attempt == 0:
-            time.sleep(0.12)
-    return wait_for_same_group(addresses, timeout=0.45)
+        time.sleep(GROUP_SETTLE)
+    return addresses_same_group(addresses)
 
 
 def saved_group_addresses(targets: list[dict]) -> list[tuple[str, ...]]:
@@ -1265,8 +1546,8 @@ def print_verbose_group_details(assessments: list[dict]) -> None:
             print(f"    - {member}")
 
 
-def restore_groups(targets: list[dict]) -> tuple[int, dict[str, str]]:
-    assigned = assign_current_addresses(targets)
+def restore_groups(targets: list[dict], target_outcomes: list[dict] | None = None) -> tuple[int, dict[str, str]]:
+    assigned = assign_current_addresses(targets, preferred=current_addresses_from_outcomes(target_outcomes))
     groups = saved_group_addresses(targets)
     if not groups:
         return 0, assigned
@@ -1440,6 +1721,8 @@ def launch_command(win: dict) -> tuple[list[str] | None, str]:
         cmd = ["google-chrome-stable"]
     elif cls in {"firefox", "firefoxdeveloperedition"}:
         cmd = ["firefox"]
+    elif cls in {"zen", "zen-browser", "zen-twilight", "app.zen_browser.zen"}:
+        cmd = [first_available_command(["zen-browser", "zen", "zen-twilight"])]
     elif cls == "obsidian":
         cmd = ["obsidian"]
     elif cls == "slack":
@@ -1448,6 +1731,8 @@ def launch_command(win: dict) -> tuple[list[str] | None, str]:
         cmd = ["discord"]
     elif cls in {"signal", "signal-desktop"}:
         cmd = ["signal-desktop"]
+    elif cls in {"telegram-desktop", "org.telegram.desktop"}:
+        cmd = [first_available_command(["Telegram", "telegram-desktop"])]
     elif cls in {"org.gnome.nautilus", "nautilus"}:
         cmd = ["nautilus", "--new-window"]
     elif cls == "thunderbird":
@@ -1574,7 +1859,11 @@ def restore_verification(
     focus_attempted: bool,
     target_outcomes: list[dict] | None = None,
 ) -> dict:
-    assigned = assign_current_addresses(targets, after_windows)
+    assigned = assign_current_addresses(
+        targets,
+        after_windows,
+        preferred=current_addresses_from_outcomes(target_outcomes),
+    )
     after_by_address = {w.get("address") or "": w for w in after_windows if w.get("address")}
     before_addresses = {w.get("address") or "" for w in before_windows if w.get("address")}
     matched_current_addresses: set[str] = set()
@@ -1951,9 +2240,11 @@ def restore(path: Path, *, save_undo: bool = True) -> None:
         else:
             skipped_unknown += 1
             _, skip_reason = launch_command(win)
+            if is_unknown_app_reason(skip_reason):
+                log_unknown_app_class(win, path)
             target_outcomes.append(target_outcome_record(win, "skipped", detail=skip_reason))
 
-    groups_restored, assigned = restore_groups(targets)
+    groups_restored, assigned = restore_groups(targets, target_outcomes)
     group_assessments = verify_saved_groups(targets, assigned)
     group_count = len(group_assessments)
     if group_count:
@@ -2100,17 +2391,28 @@ def run_menu(labels: list[str], prompt: str) -> str:
     return ""
 
 
+def session_picker_mtime(path: Path) -> float:
+    try:
+        if path.exists() or path.is_symlink():
+            return path.stat().st_mtime
+    except Exception:
+        pass
+    return -1
+
+
 def pick_session(action: str = "restore") -> None:
     choices = session_choices()
     if not choices:
         print("No sessions found", file=sys.stderr)
         sys.exit(1)
-    labels = [label for label, _ in choices]
+    choices = sorted(choices, key=lambda choice: session_picker_mtime(choice[1]), reverse=True)
+    menu_choices = [(f"{label} — {session_picker_summary(path)}", path) for label, path in choices]
+    labels = [label for label, _ in menu_choices]
     picked = run_menu(labels, f"ws {action}")
     if not picked:
         print("No session selected", file=sys.stderr)
         sys.exit(1)
-    mapping = dict(choices)
+    mapping = dict(menu_choices)
     path = mapping.get(picked)
     if not path:
         print(f"Unknown selection: {picked}", file=sys.stderr)
@@ -2246,9 +2548,10 @@ def health_status() -> None:
             print(f"  restore audit: unreadable ({LAST_RESTORE_AUDIT_FILE})")
     else:
         print("  restore audit: missing")
+    print(f"  unknown classes: {unknown_classes_summary()}")
     print("  shortcuts:")
     print(shortcuts_help_block())
-    print("  commands: ws s, ws r, ws plan, ws pick, ws a, ws as, ws u, ws undo-hard, ws status, ws deps")
+    print("  commands: ws s, ws r, ws plan, ws pick, ws a, ws as, ws u, ws undo-hard, ws status, ws deps, ws unknowns")
 
 
 def list_session(path: Path = SESSION_FILE) -> None:
@@ -2303,9 +2606,10 @@ Short commands:
   uh          hard undo: close windows launched by the last restore
   st          status/health
   deps        dependency check
+  unknowns    list app classes skipped as unknown during restore
 
 Full commands still work:
-  save [name], restore [--dry-run|--plan] [name], plan [name], dry-run [name], list [name], profiles, pick [restore|list|path], autosave, autosaves, undo, undo-hard, status, deps, path [name]
+  save [name], restore [--dry-run|--plan] [name], plan [name], dry-run [name], list [name], profiles, pick [restore|list|path], autosave, autosaves, undo, undo-hard, status, deps, unknowns, path [name]
 
 Current shortcuts:
 {shortcuts_help_block()}
@@ -2363,6 +2667,7 @@ def main() -> None:
         "u": "undo",
         "uh": "undo-hard",
         "st": "status",
+        "unk": "unknowns",
     }
     cmd = aliases.get(cmd, cmd)
     name, dry_run = parse_name_and_restore_flags(rest)
@@ -2389,6 +2694,8 @@ def main() -> None:
         health_status()
     elif cmd in {"deps", "doctor", "check"}:
         dependency_status()
+    elif cmd in {"unknowns", "unknown-classes"}:
+        list_unknown_classes()
     elif cmd in {"list", "show"}:
         list_session(session_path(name))
     elif cmd == "list-undo":

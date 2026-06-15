@@ -24,6 +24,39 @@ def load_module():
     return module
 
 
+class PickerTests(unittest.TestCase):
+    def test_picker_labels_include_compact_session_counts_and_sort_by_recent(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            older = Path(tmp) / "older.json"
+            newer = Path(tmp) / "newer.json"
+            older.write_text(json.dumps({
+                "windows": [
+                    {"class": "firefox", "workspace": {"id": 1, "name": "1"}},
+                    {"class": "ghostty", "workspace": {"id": 2, "name": "2"}, "restoreArgv": ["bash"], "grouped": ["0x1", "0x2"]},
+                    {"class": "ghostty", "workspace": {"id": 2, "name": "2"}, "grouped": ["0x1", "0x2"]},
+                ],
+            }))
+            newer.write_text(json.dumps({"windows": [{"class": "firefox", "workspace": {"id": 3, "name": "3"}}]}))
+            os.utime(older, (100, 100))
+            os.utime(newer, (200, 200))
+            seen = {}
+            mod.session_choices = lambda: [("older", older), ("newer", newer)]
+
+            def pick_first(labels, prompt):
+                seen["labels"] = labels
+                return labels[0]
+
+            mod.run_menu = pick_first
+            mod.restore = lambda path, save_undo=True: seen.setdefault("path", path)
+
+            mod.pick_session("restore")
+
+            self.assertEqual(seen["path"], newer)
+            self.assertIn("newer — w1 ws1 g0,", seen["labels"][0])
+            self.assertIn("older — w3 ws2 g1 t1,", seen["labels"][1])
+
+
 class DryRunTests(unittest.TestCase):
     def test_restore_dry_run_reports_plan_without_side_effects(self):
         mod = load_module()
@@ -178,7 +211,7 @@ class DryRunTests(unittest.TestCase):
             mod.restore_workspace_monitors = lambda targets: (0, 1)
             mod.launch_result = lambda win: next(launch_statuses)
             mod.apply_saved_state = lambda win, before_addresses: ("", 1)
-            mod.restore_groups = lambda targets: (0, {})
+            mod.restore_groups = lambda targets, target_outcomes=None: (0, {})
             mod.verify_saved_groups = lambda targets, assigned: []
             mod.restore_saved_focus = lambda data, targets, assigned, fallback: (False, True)
             mod.write_last_restore = lambda path, launched: None
@@ -196,6 +229,95 @@ class DryRunTests(unittest.TestCase):
             self.assertIn("state dispatch failures 1", text)
             self.assertIn("monitor placement failures 1", text)
             self.assertIn("focus restore failed", text)
+
+    def test_assign_current_addresses_prefers_detected_address_over_reused_saved_address(self):
+        mod = load_module()
+        targets = [{
+            "address": "0xsaved",
+            "class": "firefox",
+            "title": "Pull requests",
+            "workspace": {"id": 2, "name": "2"},
+        }]
+        current = [
+            {
+                "address": "0xsaved",
+                "class": "Alacritty",
+                "title": "Terminal",
+                "workspace": {"id": 3, "name": "3"},
+            },
+            {
+                "address": "0xactual",
+                "class": "firefox",
+                "title": "Pull requests",
+                "workspace": {"id": 2, "name": "2"},
+            },
+        ]
+
+        assigned = mod.assign_current_addresses(targets, current, preferred={"0xsaved": "0xactual"})
+
+        self.assertEqual(assigned, {"0xsaved": "0xactual"})
+
+    def test_apply_saved_state_moves_detected_window_to_saved_workspace(self):
+        mod = load_module()
+        target = {
+            "address": "0xsaved",
+            "class": "Alacritty",
+            "title": "Terminal",
+            "workspace": {"id": 4, "name": "4"},
+            "floating": False,
+        }
+        calls = []
+        mod.find_new_window = lambda target, before_addresses: {"address": "0xnew"}
+        mod.hypr = lambda *args, **kwargs: calls.append(args) or True
+
+        address, failures = mod.apply_saved_state(target, set())
+
+        self.assertEqual(address, "0xnew")
+        self.assertEqual(failures, 0)
+        self.assertIn(("dispatch", "movetoworkspacesilent", "4,address:0xnew"), calls)
+
+    def test_restore_logs_unknown_app_classes_grouped_by_class(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            session = tmp_path / "session.json"
+            session.write_text(json.dumps({
+                "windows": [
+                    {
+                        "address": "0x1",
+                        "class": "mystery-app",
+                        "title": "One",
+                        "workspace": {"id": 2, "name": "2"},
+                    },
+                    {
+                        "address": "0x2",
+                        "class": "Mystery-App",
+                        "title": "Two",
+                        "workspace": {"id": 3, "name": "3"},
+                    },
+                ],
+            }))
+            collections = iter([[], []])
+            mod.collect_windows = lambda: next(collections)
+            mod.active_window = lambda: {}
+            mod.restore_workspace_monitors = lambda targets: (0, 0)
+            mod.restore_groups = lambda targets, target_outcomes=None: (0, {})
+            mod.verify_saved_groups = lambda targets, assigned: []
+            mod.restore_saved_focus = lambda data, targets, assigned, fallback: (False, False)
+            mod.notify = lambda title, body="": None
+            mod.LAST_RESTORE_FILE = tmp_path / "last-restore.json"
+            mod.LAST_RESTORE_AUDIT_FILE = tmp_path / "last-restore-audit.json"
+            mod.UNKNOWN_CLASSES_FILE = tmp_path / "unknown-classes.json"
+
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                mod.restore(session, save_undo=False)
+
+            data = json.loads(mod.UNKNOWN_CLASSES_FILE.read_text())
+            group = data["classes"]["mystery-app"]
+            self.assertEqual(group["count"], 2)
+            self.assertEqual(group["class"], "mystery-app")
+            self.assertEqual([example["title"] for example in group["examples"]], ["Two", "One"])
+            self.assertEqual({example["source"] for example in group["examples"]}, {str(session)})
 
     def test_restore_writes_audit_with_before_after_and_verification(self):
         mod = load_module()
@@ -251,7 +373,7 @@ class DryRunTests(unittest.TestCase):
             mod.restore_workspace_monitors = lambda targets: (1, 0)
             mod.launch_result = lambda win: "launched"
             mod.apply_saved_state = lambda win, before_addresses: ("0xc2", 0)
-            mod.restore_groups = lambda targets: (0, {})
+            mod.restore_groups = lambda targets, target_outcomes=None: (0, {})
             mod.verify_saved_groups = lambda targets, assigned: []
             mod.restore_saved_focus = lambda data, targets, assigned, fallback: (True, True)
             mod.notify = lambda title, body="": None
@@ -296,7 +418,7 @@ class DryRunTests(unittest.TestCase):
             mod.active_window = lambda: {}
             mod.restore_workspace_monitors = lambda targets: (0, 0)
             mod.launch_result = lambda win: self.fail("duplicate singleton should not launch")
-            mod.restore_groups = lambda targets: (0, {})
+            mod.restore_groups = lambda targets, target_outcomes=None: (0, {})
             mod.verify_saved_groups = lambda targets, assigned: []
             mod.restore_saved_focus = lambda data, targets, assigned, fallback: (False, False)
             mod.notify = lambda title, body="": None
@@ -373,6 +495,23 @@ class RestoreCommandTests(unittest.TestCase):
                 cmd, reason = mod.launch_command({"class": "org.keepassxc.KeePassXC"})
                 self.assertEqual(reason, "")
                 self.assertEqual(cmd, ["keepassxc"])
+
+                cmd, reason = mod.launch_command({"class": "org.telegram.desktop"})
+                self.assertEqual(reason, "")
+                self.assertEqual(cmd, ["Telegram"])
+
+    def test_zen_browser_restores_as_singleton_app(self):
+        mod = load_module()
+        win = {"class": "zen", "title": "Dashboard — Zen Browser",
+               "workspace": {"id": -98, "name": "special:scratchpad"}}
+        # Zen is a single-process Firefox fork: keyed like firefox, not skipped.
+        self.assertTrue(mod.is_singleton(win))
+        self.assertEqual(mod.restore_key(win), "app:zen")
+        with mock.patch.object(mod.shutil, "which",
+                               lambda cmd: "/usr/bin/zen-browser" if cmd == "zen-browser" else None):
+            cmd, reason = mod.launch_command(win)
+            self.assertEqual(reason, "")
+            self.assertEqual(cmd, ["zen-browser"])
 
     def test_claude_alias_detection_and_restore_command(self):
         mod = load_module()
@@ -515,6 +654,92 @@ class InstallerSafetyTests(unittest.TestCase):
             self.assertIn("Refreshed", result.stdout)
             self.assertTrue(ws.is_symlink())
             self.assertEqual(os.readlink(ws), "omarchy-session")
+
+
+class GroupRestoreTests(unittest.TestCase):
+    """Exercise group_addresses against a tiny in-memory Hyprland simulator.
+
+    Hyprland grouping is asynchronous and adjacency-dependent, so the real value
+    is in surviving dropped dispatches and re-trying members that did not join on
+    the first pass.
+    """
+
+    def _simulator(self, mod, fail_once=None):
+        fail_once = dict(fail_once or {})
+        member_to_group: dict[str, set] = {}
+        focused = {"addr": None}
+
+        def window_group(address):
+            grp = member_to_group.get(address)
+            return list(grp) if grp else []
+
+        def hypr(*args, **kwargs):
+            cmd = args[1] if len(args) >= 2 else ""
+            if cmd == "focuswindow":
+                addr = args[2].split("address:", 1)[1]
+                if fail_once.get(addr):
+                    fail_once[addr] -= 1
+                    return False
+                focused["addr"] = addr
+                return True
+            if cmd == "togglegroup":
+                a = focused["addr"]
+                if a and a not in member_to_group:
+                    member_to_group[a] = {a}
+                return True
+            if cmd == "moveintogroup":
+                a = focused["addr"]
+                if a is not None:
+                    for grp in {id(g): g for g in member_to_group.values()}.values():
+                        if a not in grp:
+                            grp.add(a)
+                            member_to_group[a] = grp
+                            break
+                return True
+            return True
+
+        return member_to_group, window_group, hypr
+
+    def test_group_addresses_groups_all_members(self):
+        mod = load_module()
+        member_to_group, window_group, hypr = self._simulator(mod)
+        with mock.patch.object(mod, "window_group", window_group), \
+                mock.patch.object(mod, "hypr", hypr), \
+                mock.patch.object(mod.time, "sleep", lambda *_: None):
+            self.assertTrue(mod.group_addresses(["0x1", "0x2", "0x3"]))
+        self.assertEqual(set(member_to_group["0x1"]), {"0x1", "0x2", "0x3"})
+
+    def test_group_addresses_survives_transient_focus_failure(self):
+        mod = load_module()
+        # The middle window's first focus is dropped; it must still join on retry
+        # instead of aborting the whole group (the old code returned False here).
+        member_to_group, window_group, hypr = self._simulator(mod, fail_once={"0x2": 1})
+        with mock.patch.object(mod, "window_group", window_group), \
+                mock.patch.object(mod, "hypr", hypr), \
+                mock.patch.object(mod.time, "sleep", lambda *_: None):
+            self.assertTrue(mod.group_addresses(["0x1", "0x2", "0x3"]))
+        self.assertEqual(set(member_to_group["0x1"]), {"0x1", "0x2", "0x3"})
+
+    def test_group_addresses_noops_when_already_grouped(self):
+        mod = load_module()
+        shared = {"0x1", "0x2"}
+        member_to_group = {"0x1": shared, "0x2": shared}
+
+        def window_group(address):
+            grp = member_to_group.get(address)
+            return list(grp) if grp else []
+
+        calls = []
+
+        def hypr(*args, **kwargs):
+            calls.append(args)
+            return True
+
+        with mock.patch.object(mod, "window_group", window_group), \
+                mock.patch.object(mod, "hypr", hypr), \
+                mock.patch.object(mod.time, "sleep", lambda *_: None):
+            self.assertTrue(mod.group_addresses(["0x1", "0x2"]))
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
