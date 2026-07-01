@@ -506,6 +506,40 @@ class PiSessionDetectionTests(unittest.TestCase):
             self.assertEqual(agent["path"], str(session))
             self.assertEqual(agent["match"], "argv-session")
 
+    def test_terminal_child_state_preserves_pi_continue_arg(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp) / "project"
+            cwd.mkdir()
+
+            def fake_cwd(pid):
+                return str(cwd) if pid in {101, 102} else ""
+
+            def fake_argv(pid):
+                if pid == 101:
+                    return ["bash", "-lc", '"$@"; exec "$SHELL" -l', "omarchy-session-restore", "pi", "--continue"]
+                if pid == 102:
+                    return ["pi"]
+                return []
+
+            mod.read_proc_cwd = fake_cwd
+            mod.read_proc_argv = fake_argv
+            mod.pi_sessions_for_process = lambda seen_cwd, pid: self.fail("--continue should not use process-start scoring")
+
+            workdir, restore_argv, agent = mod.terminal_child_state(100, str(cwd), {100: [101], 101: [102]}, {})
+
+            self.assertEqual(workdir, str(cwd))
+            self.assertEqual(restore_argv, ["pi", "--continue"])
+            self.assertEqual(agent["id"], "latest")
+            self.assertEqual(agent["match"], "argv-continue")
+
+    def test_pi_continue_flag_must_follow_pi_arg(self):
+        mod = load_module()
+        self.assertTrue(mod.argv_has_pi_continue(["pi", "-c"]))
+        self.assertTrue(mod.argv_has_pi_continue(["bash", "-lc", "script", "restore", "pi", "--continue"]))
+        self.assertFalse(mod.argv_has_pi_continue(["bash", "-c", "pi"]))
+        self.assertFalse(mod.argv_has_pi_continue(["ssh", "-c", "cipher", "host", "pi"]))
+
     def test_terminal_child_state_matches_plain_pi_by_process_start_time(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as tmp:
