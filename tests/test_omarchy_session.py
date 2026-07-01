@@ -474,6 +474,65 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(calls, [Path("/tmp/demo.json")] * 4)
 
 
+class PiSessionDetectionTests(unittest.TestCase):
+    def test_terminal_child_state_preserves_explicit_pi_session_arg(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp) / "project"
+            cwd.mkdir()
+            session = Path(tmp) / "saved.jsonl"
+            session.write_text(json.dumps({"type": "session", "id": "saved", "cwd": str(cwd)}) + "\n")
+            newer = Path(tmp) / "newer.jsonl"
+            newer.write_text(json.dumps({"type": "session", "id": "newer", "cwd": str(cwd)}) + "\n")
+
+            def fake_cwd(pid):
+                return str(cwd) if pid in {101, 102} else ""
+
+            def fake_argv(pid):
+                if pid == 101:
+                    return ["bash", "-lc", '"$@"; exec "$SHELL" -l', "omarchy-session-restore", "pi", "--session", str(session)]
+                if pid == 102:
+                    return ["pi"]
+                return []
+
+            mod.read_proc_cwd = fake_cwd
+            mod.read_proc_argv = fake_argv
+            mod.pi_sessions_for_process = lambda seen_cwd, pid: [str(newer), str(session)]
+
+            workdir, restore_argv, agent = mod.terminal_child_state(100, str(cwd), {100: [101], 101: [102]}, {})
+
+            self.assertEqual(workdir, str(cwd))
+            self.assertEqual(restore_argv, ["pi", "--session", str(session)])
+            self.assertEqual(agent["path"], str(session))
+            self.assertEqual(agent["match"], "argv-session")
+
+    def test_terminal_child_state_matches_plain_pi_by_process_start_time(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp) / "project"
+            cwd.mkdir()
+            mod.PI_SESSION_ROOT = Path(tmp) / "sessions"
+            session_dir = mod.pi_session_dir_for_cwd(str(cwd))
+            session_dir.mkdir(parents=True)
+            older = session_dir / "2026-01-01T00-00-00-000Z_older.jsonl"
+            current = session_dir / "2026-02-01T00-00-00-000Z_current.jsonl"
+            older.write_text(json.dumps({"type": "session", "id": "older", "cwd": str(cwd)}) + "\n")
+            current.write_text(json.dumps({"type": "session", "id": "current", "cwd": str(cwd)}) + "\n")
+            os.utime(older, (200, 200))
+            os.utime(current, (100, 100))
+
+            mod.read_proc_cwd = lambda pid: str(cwd) if pid == 101 else ""
+            mod.read_proc_argv = lambda pid: ["pi"] if pid == 101 else []
+            mod.proc_start_time = lambda pid: mod.pi_session_created_at(str(current)) + 2
+
+            workdir, restore_argv, agent = mod.terminal_child_state(100, str(cwd), {100: [101]}, {})
+
+            self.assertEqual(workdir, str(cwd))
+            self.assertEqual(restore_argv, ["pi", "--session", str(current)])
+            self.assertEqual(agent["path"], str(current))
+            self.assertEqual(agent["match"], "cwd-process-start")
+
+
 class RestoreCommandTests(unittest.TestCase):
     def test_alacritty_and_keepassxc_restore_commands(self):
         mod = load_module()

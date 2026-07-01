@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -192,6 +193,134 @@ def pi_sessions_for_cwd(cwd: str) -> list[str]:
 def latest_pi_session_for_cwd(cwd: str) -> str:
     sessions = pi_sessions_for_cwd(cwd)
     return sessions[0] if sessions else ""
+
+
+def all_pi_sessions() -> list[str]:
+    if not PI_SESSION_ROOT.exists():
+        return []
+    sessions: list[Path] = []
+    try:
+        session_dirs = [p for p in PI_SESSION_ROOT.iterdir() if p.is_dir()]
+    except Exception:
+        return []
+    for session_dir in session_dirs:
+        try:
+            sessions.extend(p for p in session_dir.glob("*.jsonl") if p.is_file())
+        except Exception:
+            continue
+    return [str(p) for p in sorted(sessions, key=lambda p: p.stat().st_mtime, reverse=True)]
+
+
+def pi_session_id(session: str) -> str:
+    path = Path(session)
+    try:
+        with path.open(errors="ignore") as handle:
+            first = handle.readline()
+        meta = json.loads(first)
+        session_id = meta.get("id") or (meta.get("payload") or {}).get("id") or ""
+        if session_id:
+            return str(session_id)
+    except Exception:
+        pass
+    stem = path.stem
+    if "_" in stem:
+        return stem.rsplit("_", 1)[1]
+    return stem
+
+
+def resolve_pi_session_arg(session_arg: str, cwd: str) -> str:
+    if not session_arg:
+        return ""
+    if "/" in session_arg or "\\" in session_arg or session_arg.endswith(".jsonl"):
+        path = Path(session_arg).expanduser()
+        if not path.is_absolute():
+            path = Path(cwd) / path
+        try:
+            path = path.resolve()
+        except Exception:
+            path = path.absolute()
+        return str(path) if path.is_file() else ""
+
+    local_sessions = pi_sessions_for_cwd(cwd)
+    for session in local_sessions:
+        if pi_session_id(session) == session_arg:
+            return session
+    for session in local_sessions:
+        if pi_session_id(session).startswith(session_arg):
+            return session
+
+    global_sessions = all_pi_sessions()
+    for session in global_sessions:
+        if pi_session_id(session) == session_arg:
+            return session
+    for session in global_sessions:
+        if pi_session_id(session).startswith(session_arg):
+            return session
+    return ""
+
+
+def explicit_pi_session_from_argv(argv: list[str], cwd: str) -> str:
+    for i, arg in enumerate(argv):
+        if arg == "--session" and i + 1 < len(argv):
+            return resolve_pi_session_arg(argv[i + 1], cwd)
+        if arg.startswith("--session="):
+            return resolve_pi_session_arg(arg.split("=", 1)[1], cwd)
+    return ""
+
+
+def argv_invokes_pi(argv: list[str]) -> bool:
+    return any(Path(arg).name == "pi" for arg in argv)
+
+
+def proc_start_time(pid: int) -> float:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(errors="ignore")
+        rest = stat.rsplit(") ", 1)[1].split()
+        start_ticks = int(rest[19])
+        ticks_per_second = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        btime = 0
+        for line in Path("/proc/stat").read_text(errors="ignore").splitlines():
+            if line.startswith("btime "):
+                btime = int(line.split()[1])
+                break
+        if not btime:
+            return 0
+        return btime + (start_ticks / ticks_per_second)
+    except Exception:
+        return 0
+
+
+def pi_session_created_at(session: str) -> float:
+    match = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z_", Path(session).name)
+    if match:
+        date, hour, minute, second, millis = match.groups()
+        try:
+            dt = datetime.fromisoformat(f"{date}T{hour}:{minute}:{second}.{millis}+00:00")
+            return dt.timestamp()
+        except Exception:
+            pass
+    try:
+        return Path(session).stat().st_ctime
+    except Exception:
+        return 0
+
+
+def pi_sessions_for_process(cwd: str, pid: int) -> list[str]:
+    sessions = pi_sessions_for_cwd(cwd)
+    start = proc_start_time(pid)
+    if not sessions or not start:
+        return sessions
+
+    def score(session: str) -> tuple[float, float]:
+        created = pi_session_created_at(session)
+        mtime = 0.0
+        try:
+            mtime = Path(session).stat().st_mtime
+        except Exception:
+            pass
+        return (abs(created - start) if created else float("inf"), -mtime)
+
+    return sorted(sessions, key=score)
 
 
 def pi_title_label(title: str) -> str:
@@ -391,12 +520,21 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
             continue
         argv = read_proc_argv(child_pid)
         exe = Path(argv[0]).name if argv else ""
+        explicit_session = explicit_pi_session_from_argv(argv, cwd)
+        if explicit_session and argv_invokes_pi(argv):
+            used_sessions.setdefault("pi", set()).add(explicit_session)
+            return cwd, ["pi", "--session", explicit_session], {
+                "tool": "pi",
+                "id": explicit_session,
+                "path": explicit_session,
+                "match": "argv-session",
+            }
 
         if exe == "pi":
-            sessions = pi_sessions_for_cwd(cwd)
+            sessions = pi_sessions_for_process(cwd, child_pid)
             session = choose_unused_session("pi", sessions, used_sessions)
             if session:
-                return cwd, ["pi", "--session", session], {"tool": "pi", "id": session, "path": session, "match": "cwd-newest-unused"}
+                return cwd, ["pi", "--session", session], {"tool": "pi", "id": session, "path": session, "match": "cwd-process-start"}
             return cwd, ["pi", "--continue"], {"tool": "pi", "id": "latest", "match": "continue"}
 
         if exe == "claude" or exe in CLAUDE_ALIAS_COMMANDS:
