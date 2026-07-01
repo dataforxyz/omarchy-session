@@ -272,6 +272,13 @@ def argv_invokes_pi(argv: list[str]) -> bool:
     return any(Path(arg).name == "pi" for arg in argv)
 
 
+def argv_has_pi_continue(argv: list[str]) -> bool:
+    for i, arg in enumerate(argv):
+        if Path(arg).name == "pi":
+            return any(part in {"--continue", "-c"} for part in argv[i + 1:])
+    return False
+
+
 def proc_start_time(pid: int) -> float:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(errors="ignore")
@@ -529,6 +536,8 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
                 "path": explicit_session,
                 "match": "argv-session",
             }
+        if argv_has_pi_continue(argv):
+            return cwd, ["pi", "--continue"], {"tool": "pi", "id": "latest", "match": "argv-continue"}
 
         if exe == "pi":
             sessions = pi_sessions_for_process(cwd, child_pid)
