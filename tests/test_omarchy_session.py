@@ -568,6 +568,36 @@ class PiSessionDetectionTests(unittest.TestCase):
 
 
 class RestoreCommandTests(unittest.TestCase):
+    def test_codex_launcher_marker_and_custom_session_root(self):
+        mod = load_module()
+        with mock.patch.object(
+            mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}" if cmd == "my-codex" else None
+        ):
+            self.assertEqual(
+                mod.codex_command_from_process(
+                    ["codex"], {"OMARCHY_SESSION_CODEX_COMMAND": "my-codex"}
+                ),
+                "my-codex",
+            )
+            self.assertEqual(
+                mod.codex_command_from_process(["codex"], {"CODEX_LAUNCHER": "missing-wrapper"}),
+                "codex",
+            )
+            self.assertEqual(
+                mod.codex_session_root_from_env({"CODEX_HOME": "/tmp/custom-codex"}),
+                Path("/tmp/custom-codex/sessions"),
+            )
+            self.assertEqual(
+                mod.terminal_restore_argv({"restoreArgv": ["codex", "resume", "abc-123"]}),
+                ["codex", "resume", "abc-123"],
+            )
+            self.assertEqual(
+                mod.terminal_restore_argv({
+                    "agentSession": {"tool": "codex", "command": "my-codex", "id": "abc-123"},
+                }),
+                ["my-codex", "resume", "abc-123"],
+            )
+
     def test_alacritty_and_keepassxc_restore_commands(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -606,26 +636,25 @@ class RestoreCommandTests(unittest.TestCase):
             self.assertEqual(reason, "")
             self.assertEqual(cmd, ["zen-browser"])
 
-    def test_claude_alias_detection_and_restore_command(self):
+    def test_claude_wrapper_marker_and_restore_command(self):
         mod = load_module()
-        self.assertEqual(mod.claude_command_from_env({}), "clo")
-        self.assertEqual(
-            mod.claude_command_from_env({"CLAUDE_CONFIG_DIR": "/home/me/.config/claude-aliases/profiles/deepseek"}),
-            "clod",
-        )
-        self.assertEqual(
-            mod.claude_command_from_env({"CLAUDE_CONFIG_DIR": "/home/me/.config/claude-aliases/profiles/cliproxy"}),
-            "cloc",
-        )
+        self.assertEqual(mod.claude_command_from_env({}), "claude")
+        with mock.patch.object(
+            mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}" if cmd == "my-claude" else None
+        ):
+            self.assertEqual(
+                mod.claude_command_from_env({"OMARCHY_SESSION_CLAUDE_COMMAND": "my-claude"}),
+                "my-claude",
+            )
         self.assertEqual(
             mod.terminal_restore_argv({
                 "class": "Alacritty",
-                "agentSession": {"tool": "claude", "command": "cloc", "id": "abc-123"},
+                "agentSession": {"tool": "claude", "command": "my-claude", "id": "abc-123"},
             }),
-            ["cloc", "--resume", "abc-123"],
+            ["my-claude", "--resume", "abc-123"],
         )
 
-    def test_legacy_alacritty_claude_title_reopens_clo(self):
+    def test_legacy_alacritty_claude_title_reopens_claude(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
@@ -639,7 +668,7 @@ class RestoreCommandTests(unittest.TestCase):
                 self.assertEqual(reason, "")
                 self.assertEqual(cmd, [
                     "alacritty", f"--working-directory={workdir}",
-                    "-e", "bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l', "omarchy-session-restore", "clo",
+                    "-e", "bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l', "omarchy-session-restore", "claude",
                 ])
 
     def test_legacy_alacritty_pi_title_reopens_pi(self):
