@@ -57,7 +57,8 @@ scripts/install-omarchy-session.sh
 The installer copies the main script to `~/.local/bin/omarchy-session`, adds
 the `ws` and `restore-workspace` command shortcuts, and installs a **Workspace
 Sessions** launcher entry. On a standard Omarchy setup, open it with
-**Super+Space**; selecting it opens a session-actions submenu. Existing unrelated
+**Super+Space**; selecting it opens a session-actions submenu, including an
+action to save one selected workspace as any named profile. Existing unrelated
 files, symlinks, or desktop entries with those names are left untouched unless
 `--force` is supplied.
 
@@ -88,6 +89,7 @@ scripts/install-omarchy-session.sh --uninstall
 
 ```bash
 ws s work          # save the current layout as "work"
+ws s coding -w 3   # save only workspace 3 as the "coding" profile
 ws plan work       # preview a restore without changing anything
 ws r work          # restore only missing windows
 ws rs work         # choose specific windows to restore
@@ -100,6 +102,7 @@ ws st              # show save, autosave, and restore health
 
 ```text
 ws s [name]        Save the current layout
+ws s name -w 3     Save only workspace 3 as a named profile
 ws r [name]        Restore missing windows from a save/profile
 ws plan [name]     Print a read-only restore plan
 ws rs [name]       Select windows for a partial restore interactively
@@ -127,6 +130,21 @@ omarchy-session save work
 omarchy-session restore --dry-run work
 omarchy-session restore work
 ```
+
+## Workspace-only profiles
+
+Save only the windows on one or more workspaces without changing another profile:
+
+```bash
+ws s coding --workspace 3
+ws s browser-set --workspace 4,5
+```
+
+The Super+Space **Workspace Sessions** submenu provides a friendly version: pick
+**Save one workspace as profile…**, choose the workspace (for example the one
+opened with Super+3), then enter any profile name. Cross-workspace group metadata
+is removed when only part of a group is included, and saved focus is included
+only when the active window belongs to the selected workspace.
 
 ## Partial restore
 
