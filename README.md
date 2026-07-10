@@ -1,5 +1,7 @@
 # omarchy-session
 
+[![CI](https://github.com/dataforxyz/omarchy-session/actions/workflows/ci.yml/badge.svg)](https://github.com/dataforxyz/omarchy-session/actions/workflows/ci.yml)
+
 Save and restore Hyprland workspaces on Omarchy-style Linux desktops.
 
 `omarchy-session` records open windows, workspace and monitor placement, floating
@@ -11,6 +13,7 @@ an audit report.
 ## Highlights
 
 - Named workspace profiles and rotating autosaves
+- Full or partial restore by interactive selection, workspace, group, or item
 - Restore plans with a read-only dry-run mode
 - Workspace, monitor, scratchpad, floating, and fullscreen restoration
 - Best-effort Hyprland group/tab reconstruction
@@ -25,7 +28,7 @@ an audit report.
 Required:
 
 - Linux with Hyprland
-- Python 3
+- Python 3.10 or newer
 - `hyprctl`
 
 Recommended or optional:
@@ -69,12 +72,20 @@ This installs a Pi extension, Claude Code hooks, and an OpenCode plugin. Existin
 Claude/OpenCode JSON configuration is preserved and backed up before changes.
 Use `--pi`, `--claude`, or `--opencode` to install only one integration.
 
+To uninstall while preserving saved session state:
+
+```bash
+scripts/install-agent-integrations.py --uninstall
+scripts/install-omarchy-session.sh --uninstall
+```
+
 ## Quick start
 
 ```bash
 ws s work          # save the current layout as "work"
 ws plan work       # preview a restore without changing anything
 ws r work          # restore only missing windows
+ws rs work         # choose specific windows to restore
 ws pick            # choose a profile or autosave interactively
 ws st              # show save, autosave, and restore health
 ```
@@ -85,7 +96,11 @@ ws st              # show save, autosave, and restore health
 ws s [name]        Save the current layout
 ws r [name]        Restore missing windows from a save/profile
 ws plan [name]     Print a read-only restore plan
+ws rs [name]       Select windows for a partial restore interactively
 ws r --dry-run     Alternate dry-run form
+ws r work -w 3     Restore all saved windows on workspace 3
+ws r work -i 2,4-6 Restore saved item indexes 2, 4, 5, and 6
+ws r work -g 1     Restore every member of saved group 1
 ws a               Create an autosave now
 ws as              List autosaves
 ws p               List named profiles and recent autosaves
@@ -105,6 +120,31 @@ omarchy-session save work
 omarchy-session restore --dry-run work
 omarchy-session restore work
 ```
+
+## Partial restore
+
+Use `ws rs [name]` (or `ws select [name]`) for a toggle-and-reopen menu. It can
+toggle individual windows, whole workspaces, or saved groups before restoring or
+printing a plan. Without a profile name, it first opens the normal profile picker.
+
+For scripts, selectors can be repeated or comma-separated, and item/group ranges
+are accepted:
+
+```bash
+ws plan work --workspace 3
+ws r work --item 2,4-7
+ws r work --group 1 --workspace 4
+```
+
+Selectors are combined as a union. `ws l work` and `ws plan work` show stable
+one-based item and group indexes. Selecting a workspace expands to all saved
+windows on that workspace. A saved Hyprland group is reconstructed only when all
+its members are selected; selected individual members still restore normally.
+
+Partial restore does not alter the saved profile. Verification and the JSON audit
+are scoped to selected targets. If the saved active window is not selected, the
+current focus is preserved when possible. Hard undo closes only windows launched
+by that partial restore.
 
 ## What gets restored
 

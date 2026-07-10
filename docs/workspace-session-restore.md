@@ -9,6 +9,8 @@ Installed commands:
 
 - `ws s [name]` / `omarchy-session save [name]` — save current windows
 - `ws r [name]` / `omarchy-session restore [name]` — restore only missing windows
+- `ws rs [name]` / `ws select [name]` — interactively select windows, workspaces, or groups for a partial restore
+- `ws r [name] --workspace 3`, `--item 2,4-7`, or `--group 1` — scriptable partial restore selectors
 - `ws plan [name]`, `ws dry-run [name]`, or `ws r --dry-run [name]` — print the restore plan without launches, Hyprland dispatches, undo/last-restore writes, notifications, or sleeps
 - `ws a` — write a timestamped autosave
 - `ws as` — list autosaves
@@ -42,12 +44,49 @@ scripts/install-agent-integrations.py
 ```
 
 The integration installer preserves existing JSON configuration and creates
-backups before adding Claude hooks or the OpenCode plugin.
+backups before adding Claude hooks or the OpenCode plugin. Remove installed
+commands and integrations without deleting saved session state with:
+
+```bash
+scripts/install-agent-integrations.py --uninstall
+scripts/install-omarchy-session.sh --uninstall
+```
 
 The installer does not replace unrelated existing `~/.local/bin/ws` or
 `~/.local/bin/restore-workspace` entries by default. It refreshes aliases that
 are missing or already point to `omarchy-session`; pass `--force` to replace
 unrelated aliases and keep the historical clobbering behavior.
+
+## Partial restore
+
+`ws rs [name]` opens a toggle-and-reopen picker using Walker, wofi, fuzzel, rofi,
+or the numbered terminal fallback. Individual rows can be toggled directly; the
+menu can also toggle every item in a saved workspace or Hyprland group, select
+all, clear the selection, restore the selected targets, or print their plan. If
+`name` is omitted, the profile/autosave picker opens first. `ws pick select` is an
+alternate entry point.
+
+For non-interactive use, restore and plan accept selectors:
+
+```bash
+ws plan work --workspace 3
+ws r work --item 2,4-7
+ws r work --group 1 --workspace 4
+```
+
+`--workspace`, `--item`, and `--group` may be repeated; comma-separated values are
+accepted, and item/group selectors support inclusive ranges. Selectors are
+combined as a union. Stable one-based item and group indexes are printed by
+`ws list` and restore plans. Workspace selection expands to all saved windows on
+that workspace.
+
+Selecting only part of a saved group restores those windows but deliberately
+skips regrouping. Group reconstruction occurs only when every saved member is in
+the selected target set. A partial restore never edits the source profile. Its
+verification and audit consider only selected targets. Saved focus is restored
+only when the saved active window is selected; otherwise current focus is
+preserved when possible. The normal undo snapshot is still written, and hard undo
+closes only windows launched by the most recent partial restore.
 
 ## Dry-run restore plans
 
