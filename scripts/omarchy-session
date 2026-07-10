@@ -1414,7 +1414,7 @@ def restore_key(win: dict) -> str:
     workdir = win.get("restoreWorkdir") or ""
     if cls in TERMINAL_CLASSES:
         agent = win.get("agentSession") or {}
-        if agent.get("tool") and agent.get("id") and agent.get("id") != "latest":
+        if agent.get("tool") and agent.get("id") and agent.get("id") not in {"latest", "picker"}:
             return f"ws:{ws}|class:{cls}|agent:{agent.get('tool')}:{agent.get('id')}"
         return f"ws:{ws}|class:{cls}|dir:{workdir}"
     return f"ws:{ws}|class:{cls}"
@@ -1463,8 +1463,13 @@ def monitor_target(win: dict) -> str:
     return ""
 
 
-def workspace_monitor_moves(targets: list[dict]) -> list[tuple[str, str]]:
+def workspace_monitor_moves(
+    targets: list[dict], current_windows: list[dict] | None = None
+) -> list[tuple[str, str]]:
     available_names = {m.get("name") for m in raw_monitors() if m.get("name")}
+    current_monitors: dict[str, set[str]] = {}
+    for current in current_windows or []:
+        current_monitors.setdefault(workspace_spec(current), set()).add(monitor_target(current))
     moves: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for win in targets:
@@ -1477,7 +1482,7 @@ def workspace_monitor_moves(targets: list[dict]) -> list[tuple[str, str]]:
         if available_names and not monitor.isdigit() and monitor not in available_names:
             continue
         key = (ws, monitor)
-        if key in seen:
+        if key in seen or monitor in current_monitors.get(ws, set()):
             continue
         seen.add(key)
         moves.append(key)
@@ -1503,7 +1508,7 @@ def compatible_current_window(target: dict, candidate: dict) -> bool:
     if lc_class(target) in BROWSER_CLASSES:
         target_profile = browser_profile_identity(target)
         candidate_profile = browser_profile_identity(candidate)
-        if (target_profile or candidate_profile) and target_profile != candidate_profile:
+        if "browserProfileArgs" in target and (target_profile or candidate_profile) and target_profile != candidate_profile:
             return False
 
     target_title = target.get("title") or ""
@@ -1532,7 +1537,7 @@ def candidate_match_score(target: dict, candidate: dict) -> int:
     if lc_class(target) in BROWSER_CLASSES:
         target_profile = browser_profile_identity(target)
         candidate_profile = browser_profile_identity(candidate)
-        if (target_profile or candidate_profile) and target_profile != candidate_profile:
+        if "browserProfileArgs" in target and (target_profile or candidate_profile) and target_profile != candidate_profile:
             return 0
 
     target_title = target.get("title") or ""
@@ -1553,6 +1558,42 @@ def candidate_match_score(target: dict, candidate: dict) -> int:
     if is_singleton(target):
         return 60
     return 0
+
+
+def match_existing_windows(targets: list[dict], current_windows: list[dict]) -> dict[str, dict]:
+    """Greedily match saved targets to live windows using restore compatibility.
+
+    A plan must use the same best-effort identity signals as post-restore
+    verification, not only exact restore-key counts. Session IDs can legitimately
+    become temporarily unavailable while titles/workdirs still identify the same
+    live terminal.
+    """
+    used: set[str] = set()
+    matches: dict[str, dict] = {}
+    for target in targets:
+        saved_address = target.get("address") or ""
+        if not saved_address:
+            continue
+        candidates: list[tuple[int, dict]] = []
+        for candidate in current_windows:
+            current_address = candidate.get("address") or ""
+            if not current_address or current_address in used:
+                continue
+            score = candidate_match_score(target, candidate)
+            if score <= 0:
+                continue
+            if workspace_spec(target) == workspace_spec(candidate):
+                score += 10
+            if saved_address == current_address:
+                score += 5
+            candidates.append((score, candidate))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        matched = candidates[0][1]
+        matches[saved_address] = matched
+        used.add(matched.get("address") or "")
+    return matches
 
 
 def find_new_window(target: dict, before_addresses: set[str], timeout: float = 6.0) -> dict | None:
@@ -2547,8 +2588,8 @@ def restore_dry_run(path: Path, selection: dict | None = None) -> None:
         sys.exit(2)
     data = selected_restore_data(data, targets, partial=len(targets) != total_targets)
     current_windows = collect_windows()
-    current_counts = Counter(restore_key(w) for w in current_windows)
-    monitor_moves = workspace_monitor_moves(targets)
+    existing_matches = match_existing_windows(targets, current_windows)
+    monitor_moves = workspace_monitor_moves(targets, current_windows)
     duplicate_singletons = duplicate_singleton_addresses(targets)
     launched = 0
     skipped_open = 0
@@ -2579,20 +2620,15 @@ def restore_dry_run(path: Path, selection: dict | None = None) -> None:
                 planned_actions[address] = "duplicate_singleton_unsupported"
             print(f"  unsupported duplicate singleton: {label} ({key})")
             continue
-        if current_counts[key] > 0:
-            if not is_singleton(win):
-                current_counts[key] -= 1
+        if address in existing_matches:
             skipped_open += 1
-            if address:
-                planned_actions[address] = "already_open"
+            planned_actions[address] = "already_open"
             print(f"  already open: {label}")
             continue
 
         cmd, skip_reason = launch_command(win)
         if cmd:
             launched += 1
-            if is_singleton(win) or is_webapp(win):
-                current_counts[key] += 1
             if address:
                 planned_actions[address] = "would_launch"
             print(f"  would launch: {label} -> {shlex.join(cmd)}")
@@ -2684,7 +2720,7 @@ def restore(path: Path, *, save_undo: bool = True, selection: dict | None = None
     current_windows = collect_windows()
     before_active = active_session_snapshot(current_windows)
     before_addresses = {w.get("address") or "" for w in current_windows}
-    current_counts = Counter(restore_key(w) for w in current_windows)
+    existing_matches = match_existing_windows(targets, current_windows)
     duplicate_singletons = duplicate_singleton_addresses(targets)
     monitors_restored, monitor_failures = restore_workspace_monitors(targets)
     launched = 0
@@ -2699,7 +2735,6 @@ def restore(path: Path, *, save_undo: bool = True, selection: dict | None = None
     target_outcomes: list[dict] = []
 
     for win in targets:
-        key = restore_key(win)
         saved_address = win.get("address") or ""
         if saved_address in duplicate_singletons:
             duplicate_singletons_unsupported += 1
@@ -2709,11 +2744,11 @@ def restore(path: Path, *, save_undo: bool = True, selection: dict | None = None
                 detail="multiple saved singleton app targets share one restore key; this app may reuse an existing window/tab",
             ))
             continue
-        if current_counts[key] > 0:
-            if not is_singleton(win):
-                current_counts[key] -= 1
+        if saved_address in existing_matches:
             skipped_open += 1
-            target_outcomes.append(target_outcome_record(win, "already_open"))
+            target_outcomes.append(target_outcome_record(
+                win, "already_open", current_address=existing_matches[saved_address].get("address") or ""
+            ))
             continue
         launch_status = launch_result(win)
         if launch_status == "launched":
@@ -2736,8 +2771,6 @@ def restore(path: Path, *, save_undo: bool = True, selection: dict | None = None
                 target_outcomes.append(target_outcome_record(
                     win, "launched_undetected", dispatch_failures=dispatch_failures
                 ))
-            if is_singleton(win) or is_webapp(win):
-                current_counts[key] += 1
             time.sleep(0.35)
         elif launch_status == "dispatch_failed":
             launch_dispatch_failed += 1

@@ -55,6 +55,10 @@ scripts/install-agent-integrations.py --uninstall
 scripts/install-omarchy-session.sh --uninstall
 ```
 
+When the autosave loop is already running or its user service is enabled, the
+installer restarts it after replacing the command. This prevents a long-lived
+Python process from continuing to write autosaves with old matching behavior.
+
 The installer does not replace unrelated existing `~/.local/bin/ws`,
 `~/.local/bin/restore-workspace`, or
 `~/.local/share/applications/omarchy-session.desktop` entries by default. It
@@ -116,7 +120,10 @@ Use `ws plan [name]`, `ws pick plan`, `ws dry-run [name]`, `ws r --dry-run [name
 plan loads the saved session and compares it with the current Hyprland windows.
 It reports windows that are already open, windows that would be launched, windows
 that would be skipped because the app class or optional command is unavailable,
-and monitor/group/focus actions. Group reporting distinguishes groups that are
+and monitor/group/focus actions. Existing-window planning uses exact restore keys
+plus compatible title and working-directory matching, while `picker` fallback
+markers are treated as non-authoritative. Monitor moves already satisfied by the
+live layout are omitted. Group reporting distinguishes groups that are
 already correct, would need regrouping, have partial/missing members, or cannot
 be assessed; `-v` adds per-group member detail.
 
