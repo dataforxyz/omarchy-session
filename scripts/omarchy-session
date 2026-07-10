@@ -2951,6 +2951,8 @@ def pick_session(action: str = "restore") -> None:
         restore(path, save_undo=True)
     elif action in {"select", "partial", "rs"}:
         partial_restore_picker(path)
+    elif action in {"plan", "preview", "dry-run"}:
+        restore_dry_run(path)
     elif action in {"list", "l", "show"}:
         list_session(path)
     elif action in {"path", "p"}:
@@ -3099,6 +3101,7 @@ def session_action_menu() -> None:
         "󰩭  Restore selected…",
         "󰍉  Choose profile or autosave…",
         "󰋼  Preview default plan",
+        "󰍉  Preview profile or autosave…",
         "󰆓  Autosave now",
         "󰕌  Undo last restore",
         "󰕌  Hard undo launched windows",
@@ -3119,8 +3122,11 @@ def session_action_menu() -> None:
         partial_restore_picker(pick_session_path("Select saved session"))
     elif "Choose profile" in picked:
         pick_session("restore")
-    elif "Preview" in picked:
+    elif "Preview default" in picked:
         open_command_terminal("plan")
+    elif "Preview profile" in picked:
+        path = pick_session_path("Preview saved session")
+        open_command_terminal("plan-path", str(path))
     elif "Autosave" in picked:
         path = autosave_once(quiet=True)
         notify("Omarchy session autosave", session_file_summary(path))
@@ -3326,7 +3332,7 @@ Short commands:
   rs [name]   interactively select windows for a partial restore
   l [name]    list (shows stable item/group indexes)
   p           profiles/named setups
-  pick        pick a profile/autosave and restore it (`ws pick select` for partial)
+  pick        pick a profile/autosave (`ws pick select` or `ws pick plan` for other actions)
   a           autosave now
   as          list autosaves
   u           undo/restore pre-restore state
@@ -3337,7 +3343,7 @@ Short commands:
   unknowns    list app classes skipped as unknown during restore
 
 Full commands still work:
-  save [name], restore [selectors] [--dry-run|--plan] [name], select [name], plan [selectors] [name], dry-run [name], list [name], profiles, pick [restore|select|list|path], autosave, autosaves, undo, undo-hard, status, deps, menu, unknowns, path [name]
+  save [name], restore [selectors] [--dry-run|--plan] [name], select [name], plan [selectors] [name], dry-run [name], list [name], profiles, pick [restore|select|plan|list|path], autosave, autosaves, undo, undo-hard, status, deps, menu, unknowns, path [name]
 
 Current shortcuts:
 {shortcuts_help_block()}
@@ -3457,6 +3463,11 @@ def main() -> None:
             restore(session_path(name), save_undo=True, selection=selection)
     elif cmd in {"plan", "dry-run"}:
         restore_dry_run(session_path(name), selection)
+    elif cmd == "plan-path":
+        if not name:
+            print("plan-path requires a saved session file", file=sys.stderr)
+            sys.exit(2)
+        restore_dry_run(Path(name), selection)
     elif cmd == "undo":
         restore(UNDO_FILE, save_undo=False)
     elif cmd in {"undo-hard", "hard-undo"}:

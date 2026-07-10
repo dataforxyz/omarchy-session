@@ -98,6 +98,7 @@ ws plan work       # preview a restore without changing anything
 ws r work          # restore only missing windows
 ws rs work         # choose specific windows to restore
 ws pick            # choose a profile or autosave interactively
+ws pick plan       # choose a profile/autosave and preview its restore plan
 ws menu            # open the session-actions submenu
 ws st              # show save, autosave, and restore health
 ```
@@ -118,6 +119,7 @@ ws a               Create an autosave now
 ws as              List autosaves
 ws p               List named profiles and recent autosaves
 ws pick            Select a profile or autosave interactively
+ws pick plan       Select a profile/autosave and preview it without restoring
 ws u               Soft undo: restore the pre-restore snapshot
 ws uh              Hard undo: close windows launched by the last restore
 ws st              Show status and health information
@@ -286,6 +288,10 @@ Always preview an unfamiliar or old save first:
 ```bash
 ws plan work
 ```
+
+From the Super+Space **Workspace Sessions** submenu, use **Preview profile or
+autosave…** to pick any save before opening its plan. The terminal equivalent is
+`ws pick plan`; **Preview default plan** remains as the one-click default option.
 
 Dry-run mode does not launch applications, dispatch Hyprland commands, write
 undo/restore state, send notifications, or sleep between launches.

@@ -17,6 +17,7 @@ Installed commands:
 - `ws as` — list autosaves
 - `ws p` — list named profiles and recent autosaves
 - `ws pick` / `ws pk` — choose a named profile or recent autosave from Walker/wofi/fuzzel/rofi, falling back to a numbered terminal picker
+- `ws pick plan` — choose any profile/autosave and print its read-only restore plan
 - `ws u` — soft undo: restore the pre-restore undo snapshot
 - `ws uh` / `ws undo-hard` — hard undo: close windows launched by the previous restore only
 - `ws st` / `ws status` — show autosave health, save ages/counts, install path, shortcuts, and last-restore info
@@ -61,7 +62,7 @@ refreshes entries that are missing or already managed by `omarchy-session`; pass
 `--force` to replace unrelated entries. The desktop entry appears as
 **Workspace Sessions** in Omarchy's Super+Space app launcher and opens a submenu
 for full-layout save, saving one selected workspace as a named profile, restore,
-selective restore, profile/autosave selection, preview, autosave, undo, hard
+selective restore, profile/autosave selection, default or picked-save preview, autosave, undo, hard
 undo, status, and dependency checks.
 
 ## Workspace-only profiles
@@ -110,7 +111,7 @@ closes only windows launched by the most recent partial restore.
 
 ## Dry-run restore plans
 
-Use `ws plan [name]`, `ws dry-run [name]`, `ws r --dry-run [name]`, or
+Use `ws plan [name]`, `ws pick plan`, `ws dry-run [name]`, `ws r --dry-run [name]`, or
 `omarchy-session restore --dry-run [name]` to inspect what restore would do. The
 plan loads the saved session and compares it with the current Hyprland windows.
 It reports windows that are already open, windows that would be launched, windows
