@@ -15,6 +15,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "omarchy-session"
 INSTALLER = REPO_ROOT / "scripts" / "install-omarchy-session.sh"
+INTEGRATION_INSTALLER = REPO_ROOT / "scripts" / "install-agent-integrations.py"
 
 
 def load_module():
@@ -498,7 +499,6 @@ class PiSessionDetectionTests(unittest.TestCase):
 
             mod.read_proc_cwd = fake_cwd
             mod.read_proc_argv = fake_argv
-            mod.pi_sessions_for_process = lambda seen_cwd, pid: [str(newer), str(session)]
 
             workdir, restore_argv, agent = mod.terminal_child_state(100, str(cwd), {100: [101], 101: [102]}, {})
 
@@ -507,34 +507,20 @@ class PiSessionDetectionTests(unittest.TestCase):
             self.assertEqual(agent["path"], str(session))
             self.assertEqual(agent["match"], "argv-session")
 
-    def test_terminal_child_state_resolves_pi_continue_to_exact_session(self):
+    def test_terminal_child_state_uses_picker_for_pi_continue_without_registry(self):
         mod = load_module()
-        with tempfile.TemporaryDirectory() as tmp:
-            cwd = Path(tmp) / "project"
-            cwd.mkdir()
-            session = Path(tmp) / "continued.jsonl"
-            session.write_text(json.dumps({"type": "session", "id": "continued", "cwd": str(cwd)}) + "\n")
+        cwd = "/tmp/project"
+        mod.read_proc_cwd = lambda pid: cwd
+        mod.read_proc_argv = lambda pid: ["pi", "--continue"]
+        mod.read_proc_environ = lambda pid: {}
+        mod.agent_registry_record = lambda tool, pid, env=None: {}
 
-            def fake_cwd(pid):
-                return str(cwd) if pid in {101, 102} else ""
+        workdir, restore_argv, agent = mod.terminal_child_state(100, cwd, {100: [101]}, {})
 
-            def fake_argv(pid):
-                if pid == 101:
-                    return ["bash", "-lc", '"$@"; exec "$SHELL" -l', "omarchy-session-restore", "pi", "--continue"]
-                if pid == 102:
-                    return ["pi"]
-                return []
-
-            mod.read_proc_cwd = fake_cwd
-            mod.read_proc_argv = fake_argv
-            mod.pi_sessions_for_process = lambda seen_cwd, pid: [str(session)]
-
-            workdir, restore_argv, agent = mod.terminal_child_state(100, str(cwd), {100: [101], 101: [102]}, {})
-
-            self.assertEqual(workdir, str(cwd))
-            self.assertEqual(restore_argv, ["pi", "--session", str(session)])
-            self.assertEqual(agent["id"], str(session))
-            self.assertEqual(agent["match"], "process-activity")
+        self.assertEqual(workdir, cwd)
+        self.assertEqual(restore_argv, ["pi", "--resume"])
+        self.assertEqual(agent["id"], "picker")
+        self.assertEqual(agent["match"], "picker-fallback")
 
     def test_pi_continue_flag_must_follow_pi_arg(self):
         mod = load_module()
@@ -543,31 +529,18 @@ class PiSessionDetectionTests(unittest.TestCase):
         self.assertFalse(mod.argv_has_pi_continue(["bash", "-c", "pi"]))
         self.assertFalse(mod.argv_has_pi_continue(["ssh", "-c", "cipher", "host", "pi"]))
 
-    def test_terminal_child_state_matches_plain_pi_by_process_start_time(self):
+    def test_terminal_child_state_uses_picker_for_plain_pi_without_registry(self):
         mod = load_module()
-        with tempfile.TemporaryDirectory() as tmp:
-            cwd = Path(tmp) / "project"
-            cwd.mkdir()
-            mod.PI_SESSION_ROOT = Path(tmp) / "sessions"
-            session_dir = mod.pi_session_dir_for_cwd(str(cwd))
-            session_dir.mkdir(parents=True)
-            older = session_dir / "2026-01-01T00-00-00-000Z_older.jsonl"
-            current = session_dir / "2026-02-01T00-00-00-000Z_current.jsonl"
-            older.write_text(json.dumps({"type": "session", "id": "older", "cwd": str(cwd)}) + "\n")
-            current.write_text(json.dumps({"type": "session", "id": "current", "cwd": str(cwd)}) + "\n")
-            os.utime(older, (200, 200))
-            os.utime(current, (100, 100))
+        cwd = "/tmp/project"
+        mod.read_proc_cwd = lambda pid: cwd
+        mod.read_proc_argv = lambda pid: ["pi"]
+        mod.read_proc_environ = lambda pid: {}
+        mod.agent_registry_record = lambda tool, pid, env=None: {}
 
-            mod.read_proc_cwd = lambda pid: str(cwd) if pid == 101 else ""
-            mod.read_proc_argv = lambda pid: ["pi"] if pid == 101 else []
-            mod.proc_start_time = lambda pid: mod.pi_session_created_at(str(current)) + 2
+        _, restore_argv, agent = mod.terminal_child_state(100, cwd, {100: [101]}, {})
 
-            workdir, restore_argv, agent = mod.terminal_child_state(100, str(cwd), {100: [101]}, {})
-
-            self.assertEqual(workdir, str(cwd))
-            self.assertEqual(restore_argv, ["pi", "--session", str(current)])
-            self.assertEqual(agent["path"], str(current))
-            self.assertEqual(agent["match"], "process-activity")
+        self.assertEqual(restore_argv, ["pi", "--resume"])
+        self.assertEqual(agent["match"], "picker-fallback")
 
 
 class AgentSessionMatchingTests(unittest.TestCase):
@@ -578,118 +551,104 @@ class AgentSessionMatchingTests(unittest.TestCase):
         self.assertEqual(mod.explicit_codex_session_from_argv(["codex", "resume", "codex-id"]), "codex-id")
         self.assertEqual(mod.explicit_opencode_session_from_argv(["opencode", "--session", "ses_exact"]), "ses_exact")
 
-    def test_codex_candidates_filter_subagents_and_match_process_activity(self):
+    def test_registry_record_requires_matching_pid_and_process_start(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "sessions"
-            root.mkdir()
-            cwd = str(Path(tmp) / "project")
+            root = Path(tmp)
+            path = root / "pi/123.json"
+            path.parent.mkdir()
+            path.write_text(json.dumps({
+                "tool": "pi", "pid": 123, "processStartTicks": 456,
+                "sessionId": "session-id", "sessionFile": "/tmp/session.jsonl",
+            }))
+            mod.agent_registry_root = lambda env=None: root
+            mod.proc_start_ticks = lambda pid: 456
+            self.assertEqual(mod.agent_registry_record("pi", 123)["sessionId"], "session-id")
+            mod.proc_start_ticks = lambda pid: 999
+            self.assertEqual(mod.agent_registry_record("pi", 123), {})
 
-            def write_session(name, session_id, timestamp, thread_source="user"):
-                path = root / name
-                path.write_text(json.dumps({
-                    "timestamp": timestamp,
-                    "payload": {
-                        "id": session_id,
-                        "cwd": cwd,
-                        "timestamp": timestamp,
-                        "thread_source": thread_source,
-                        "source": {"subagent": {}} if thread_source == "subagent" else "cli",
-                    },
-                }) + "\n")
-                return path
-
-            write_session("a.jsonl", "session-a", "2026-01-01T00:00:10Z")
-            write_session("b.jsonl", "session-b", "2026-01-01T00:01:40Z")
-            write_session("subagent.jsonl", "wrong-subagent", "2026-01-01T00:00:11Z", "subagent")
-            mod.proc_start_time = lambda pid: mod.timestamp_epoch("2026-01-01T00:00:09Z")
-
-            self.assertEqual(
-                mod.codex_sessions_for_process(cwd, 123, root),
-                ["session-a", "session-b"],
-            )
-
-    def test_same_cwd_windows_get_distinct_sessions_for_all_agents(self):
-        mod = load_module()
-        cwd = "/tmp/project"
-        used = {}
-        mod.read_proc_cwd = lambda pid: cwd
-        mod.read_proc_environ = lambda pid: {}
-
-        mod.pi_sessions_for_process = lambda seen_cwd, pid: ["/tmp/pi-a.jsonl", "/tmp/pi-b.jsonl"]
-        mod.read_proc_argv = lambda pid: ["pi"]
-        first = mod.terminal_child_state(9, cwd, {9: [901]}, used)
-        second = mod.terminal_child_state(10, cwd, {10: [1001]}, used)
-        third = mod.terminal_child_state(11, cwd, {11: [1101]}, used)
-        self.assertEqual(first[2]["id"], "/tmp/pi-a.jsonl")
-        self.assertEqual(second[2]["id"], "/tmp/pi-b.jsonl")
-        self.assertEqual(third[1], ["pi", "--resume"])
-        self.assertEqual(third[2]["match"], "picker-fallback")
-
-        mod.claude_sessions_for_process = lambda seen_cwd, pid, root: ["claude-a", "claude-b"]
-        mod.read_proc_argv = lambda pid: ["claude"]
-        first = mod.terminal_child_state(1, cwd, {1: [101]}, used)
-        second = mod.terminal_child_state(2, cwd, {2: [201]}, used)
-        third = mod.terminal_child_state(7, cwd, {7: [701]}, used)
-        self.assertEqual(first[2]["id"], "claude-a")
-        self.assertEqual(second[2]["id"], "claude-b")
-        self.assertEqual(third[1], ["claude", "--resume"])
-        self.assertEqual(third[2]["match"], "picker-fallback")
-
-        mod.codex_sessions_for_process = lambda seen_cwd, pid, root: ["codex-a", "codex-b"]
-        mod.read_proc_argv = lambda pid: ["codex"]
-        first = mod.terminal_child_state(3, cwd, {3: [301]}, used)
-        second = mod.terminal_child_state(4, cwd, {4: [401]}, used)
-        third = mod.terminal_child_state(8, cwd, {8: [801]}, used)
-        self.assertEqual(first[2]["id"], "codex-a")
-        self.assertEqual(second[2]["id"], "codex-b")
-        self.assertEqual(third[1], ["codex", "resume"])
-        self.assertEqual(third[2]["match"], "picker-fallback")
-
-        mod.opencode_sessions_for_process = lambda seen_cwd, pid, db: ["ses_a", "ses_b"]
-        mod.read_proc_argv = lambda pid: ["opencode"]
-        first = mod.terminal_child_state(5, cwd, {5: [501]}, used)
-        second = mod.terminal_child_state(6, cwd, {6: [601]}, used)
-        self.assertEqual(first[2]["id"], "ses_a")
-        self.assertEqual(second[2]["id"], "ses_b")
-
-    def test_opencode_candidates_filter_child_sessions_and_match_message_activity(self):
+    def test_pid_registry_is_authoritative_for_pi_claude_and_opencode(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as tmp:
-            db = Path(tmp) / "opencode.db"
+            session_file = Path(tmp) / "pi.jsonl"
+            session_file.write_text("{}\n")
             cwd = "/tmp/project"
+            mod.read_proc_cwd = lambda pid: cwd
+            mod.read_proc_argv = lambda pid: ["agent"]
+            mod.read_proc_environ = lambda pid: {}
+
+            records = {
+                ("pi", 101): {"tool": "pi", "pid": 101, "sessionId": "pi-id", "sessionFile": str(session_file), "cwd": cwd},
+                ("claude", 201): {"tool": "claude", "pid": 201, "sessionId": "claude-id", "cwd": cwd},
+                ("opencode", 301): {"tool": "opencode", "pid": 301, "sessionId": "ses_exact", "cwd": cwd},
+            }
+            mod.agent_registry_record = lambda tool, pid, env=None: records.get((tool, pid), {})
+
+            pi_result = mod.terminal_child_state(1, cwd, {1: [101]}, {})
+            claude_result = mod.terminal_child_state(2, cwd, {2: [201]}, {})
+            opencode_result = mod.terminal_child_state(3, cwd, {3: [301]}, {})
+
+            self.assertEqual(pi_result[1], ["pi", "--session", str(session_file)])
+            self.assertEqual(pi_result[2]["match"], "pid-registry")
+            self.assertEqual(claude_result[1], ["claude", "--resume", "claude-id"])
+            self.assertEqual(claude_result[2]["match"], "pid-registry")
+            self.assertIn("opencode --session ses_exact", opencode_result[1][-1])
+            self.assertEqual(opencode_result[2]["match"], "pid-registry")
+
+    def test_codex_pid_log_mapping_filters_subagent_threads(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / ".codex"
+            sessions = home / "sessions"
+            sessions.mkdir(parents=True)
+            cwd = "/tmp/project"
+
+            def write_session(name, session_id, thread_source):
+                (sessions / name).write_text(json.dumps({
+                    "payload": {
+                        "id": session_id, "cwd": cwd,
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "thread_source": thread_source,
+                        "source": {"subagent": {"depth": 1}} if thread_source == "subagent" else "cli",
+                    }
+                }) + "\n")
+
+            write_session("main.jsonl", "main-thread", "user")
+            write_session("sub.jsonl", "sub-thread", "subagent")
+            db = home / "logs_2.sqlite"
             conn = sqlite3.connect(db)
             try:
-                conn.executescript("""
-                    create table session (
-                        id text primary key, parent_id text, directory text, path text,
-                        time_created integer, time_updated integer
-                    );
-                    create table message (
-                        id text primary key, session_id text, time_created integer, time_updated integer
-                    );
-                """)
+                conn.execute("create table logs (id integer primary key, thread_id text, process_uuid text)")
                 conn.executemany(
-                    "insert into session values (?, ?, ?, ?, ?, ?)",
-                    [
-                        ("ses_a", None, cwd, cwd, 10_000, 500_000),
-                        ("ses_b", None, cwd, cwd, 20_000, 600_000),
-                        ("ses_child", "ses_a", cwd, cwd, 100_000, 700_000),
-                    ],
-                )
-                conn.executemany(
-                    "insert into message values (?, ?, ?, ?)",
-                    [
-                        ("msg-a", "ses_a", 100_100, 100_100),
-                        ("msg-b", "ses_b", 300_000, 300_000),
-                        ("msg-child", "ses_child", 100_050, 100_050),
-                    ],
+                    "insert into logs (thread_id, process_uuid) values (?, ?)",
+                    [("main-thread", "pid:123:abc"), ("sub-thread", "pid:123:abc")],
                 )
                 conn.commit()
             finally:
                 conn.close()
-            mod.proc_start_time = lambda pid: 100
-            self.assertEqual(mod.opencode_sessions_for_process(cwd, 123, db), ["ses_a", "ses_b"])
+
+            env = {"CODEX_HOME": str(home)}
+            self.assertEqual(mod.codex_session_from_process_logs(123, cwd, env), "main-thread")
+
+    def test_missing_exact_mapping_never_guesses_from_cwd(self):
+        mod = load_module()
+        cwd = "/tmp/project"
+        mod.read_proc_cwd = lambda pid: cwd
+        mod.read_proc_environ = lambda pid: {}
+        mod.agent_registry_record = lambda tool, pid, env=None: {}
+        mod.codex_session_from_process_logs = lambda pid, seen_cwd, env: ""
+
+        expectations = [
+            (["pi"], ["pi", "--resume"], "picker-fallback"),
+            (["claude"], ["claude", "--resume"], "picker-fallback"),
+            (["codex"], ["codex", "resume"], "picker-fallback"),
+            (["opencode"], ["opencode"], "plain-fallback"),
+        ]
+        for index, (argv, expected_argv, expected_match) in enumerate(expectations, start=1):
+            mod.read_proc_argv = lambda pid, value=argv: value
+            result = mod.terminal_child_state(index, cwd, {index: [1000 + index]}, {})
+            self.assertEqual(result[1], expected_argv)
+            self.assertEqual(result[2]["match"], expected_match)
 
 
 class RestoreCommandTests(unittest.TestCase):
@@ -793,50 +752,28 @@ class RestoreCommandTests(unittest.TestCase):
                 self.assertEqual(reason, "")
                 self.assertEqual(cmd, [
                     "alacritty", f"--working-directory={workdir}",
-                    "-e", "bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l', "omarchy-session-restore", "claude",
+                    "-e", "bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l', "omarchy-session-restore",
+                    "claude", "--resume",
                 ])
 
-    def test_legacy_alacritty_pi_title_reopens_pi(self):
+    def test_legacy_alacritty_pi_title_opens_picker_without_guessing(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
-            session = workdir / "session.jsonl"
-            session.write_text("{}\n")
-            with mock.patch.object(mod, "legacy_pi_session_candidates", lambda win: [str(session)]):
-                win = {
-                    "class": "Alacritty",
-                    "title": "pi - demo:🚧",
-                    "restoreWorkdir": str(workdir),
-                    "restoreArgv": [],
-                }
-                mod.enrich_legacy_terminal_targets([win])
+            win = {
+                "class": "Alacritty",
+                "title": "pi - demo:🚧",
+                "restoreWorkdir": str(workdir),
+                "restoreArgv": [],
+            }
             with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
                 cmd, reason = mod.launch_command(win)
                 self.assertEqual(reason, "")
                 self.assertEqual(cmd, [
                     "alacritty", f"--working-directory={workdir}",
                     "-e", "bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l', "omarchy-session-restore",
-                    "pi", "--session", str(session),
+                    "pi", "--resume",
                 ])
-
-    def test_legacy_pi_session_cwd_replaces_home_workdir(self):
-        mod = load_module()
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp) / "home"
-            project = Path(tmp) / "project"
-            home.mkdir()
-            project.mkdir()
-            session = Path(tmp) / "session.jsonl"
-            session.write_text(json.dumps({"cwd": str(project)}) + "\n")
-            win = {
-                "class": "Alacritty",
-                "title": "pi - project:🚧",
-                "restoreWorkdir": str(home),
-                "restoreArgv": [],
-            }
-            with mock.patch.object(mod, "legacy_pi_session_candidates", lambda win: [str(session)]):
-                mod.enrich_legacy_terminal_targets([win])
-            self.assertEqual(win["restoreWorkdir"], str(project))
 
     def test_chromium_webapp_recovers_single_string_argv_and_class_url(self):
         mod = load_module()
@@ -901,6 +838,44 @@ class InstallerSafetyTests(unittest.TestCase):
             self.assertIn("Refreshed", result.stdout)
             self.assertTrue(ws.is_symlink())
             self.assertEqual(os.readlink(ws), "omarchy-session")
+
+
+class IntegrationInstallerTests(unittest.TestCase):
+    def test_installer_preserves_existing_claude_and_opencode_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            claude_settings = home / ".claude/settings.json"
+            claude_settings.parent.mkdir(parents=True)
+            claude_settings.write_text(json.dumps({
+                "theme": "dark",
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "existing-hook"}]}]},
+            }))
+            opencode_config = home / ".config/opencode/opencode.json"
+            opencode_config.parent.mkdir(parents=True)
+            opencode_config.write_text(json.dumps({"provider": {"demo": {}}, "plugin": ["existing-plugin"]}))
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+
+            subprocess.run([sys.executable, str(INTEGRATION_INSTALLER)], env=env, check=True, capture_output=True, text=True)
+            subprocess.run([sys.executable, str(INTEGRATION_INSTALLER)], env=env, check=True, capture_output=True, text=True)
+
+            claude = json.loads(claude_settings.read_text())
+            self.assertEqual(claude["theme"], "dark")
+            self.assertEqual(claude["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "existing-hook")
+            self.assertEqual(len(claude["hooks"]["SessionStart"]), 1)
+            self.assertEqual(len(claude["hooks"]["UserPromptSubmit"]), 1)
+            self.assertEqual(len(claude["hooks"]["SessionEnd"]), 1)
+
+            opencode = json.loads(opencode_config.read_text())
+            self.assertIn("demo", opencode["provider"])
+            self.assertIn("existing-plugin", opencode["plugin"])
+            self.assertEqual(
+                sum("omarchy-session-registry.ts" in str(plugin) for plugin in opencode["plugin"]),
+                1,
+            )
+            self.assertTrue((home / ".pi/agent/extensions/omarchy-session-registry.ts").exists())
+            self.assertTrue((home / ".local/lib/omarchy-session/claude-session-registry.py").exists())
+            self.assertTrue((home / ".config/opencode/plugins/omarchy-session-registry.ts").exists())
 
 
 class GroupRestoreTests(unittest.TestCase):
