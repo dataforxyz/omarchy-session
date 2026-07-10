@@ -59,6 +59,93 @@ class PickerTests(unittest.TestCase):
             self.assertIn("older — w3 ws2 g1 t1,", seen["labels"][1])
 
 
+class PartialRestoreTests(unittest.TestCase):
+    def sample_data(self):
+        group = ["0x2", "0x3"]
+        return {
+            "activeWindow": {"address": "0x3", "workspace": {"id": 2, "name": "2"}},
+            "windows": [
+                {"address": "0x1", "class": "firefox", "title": "Web", "workspace": {"id": 1, "name": "1"}, "grouped": []},
+                {"address": "0x2", "class": "Alacritty", "title": "One", "workspace": {"id": 2, "name": "2"}, "grouped": group, "groupIndex": 0, "groupSize": 2},
+                {"address": "0x3", "class": "Alacritty", "title": "Two", "workspace": {"id": 2, "name": "2"}, "grouped": group, "groupIndex": 1, "groupSize": 2},
+                {"address": "0x4", "class": "obsidian", "title": "Notes", "workspace": {"id": 3, "name": "3"}, "grouped": []},
+            ],
+        }
+
+    def test_item_workspace_and_group_selectors(self):
+        mod = load_module()
+        data = self.sample_data()
+
+        item_targets, total = mod.select_restore_targets(data, {"items": {2}, "groups": set(), "workspaces": set()})
+        self.assertEqual(total, 4)
+        self.assertEqual([w["address"] for w in item_targets], ["0x2"])
+        self.assertEqual(item_targets[0]["grouped"], [])
+        self.assertEqual(item_targets[0]["_restoreItemIndex"], 2)
+
+        group_targets, _ = mod.select_restore_targets(data, {"items": set(), "groups": {1}, "workspaces": set()})
+        self.assertEqual([w["address"] for w in group_targets], ["0x2", "0x3"])
+        self.assertEqual(group_targets[0]["grouped"], ["0x2", "0x3"])
+
+        workspace_targets, _ = mod.select_restore_targets(data, {"items": set(), "groups": set(), "workspaces": {"2"}})
+        self.assertEqual([w["address"] for w in workspace_targets], ["0x2", "0x3"])
+
+    def test_partial_selection_drops_unselected_saved_focus(self):
+        mod = load_module()
+        data = self.sample_data()
+        targets, _ = mod.select_restore_targets(data, {"items": {1}, "groups": set(), "workspaces": set()})
+        selected = mod.selected_restore_data(data, targets)
+        self.assertEqual(selected["activeWindow"], {})
+        self.assertEqual([w["address"] for w in selected["windows"]], ["0x1"])
+
+    def test_cli_parses_partial_restore_selectors(self):
+        mod = load_module()
+        calls = []
+        mod.session_path = lambda name=None: Path(f"/tmp/{name or 'default'}.json")
+        mod.restore = lambda path, save_undo=True, selection=None: calls.append((path, selection))
+        with mock.patch.object(sys, "argv", [
+            "ws", "restore", "demo", "--workspace", "2,3", "--group=1-2", "--item", "4,6-7",
+        ]):
+            mod.main()
+        path, selection = calls[0]
+        self.assertEqual(path, Path("/tmp/demo.json"))
+        self.assertEqual(selection["workspaces"], {"2", "3"})
+        self.assertEqual(selection["groups"], {1, 2})
+        self.assertEqual(selection["items"], {4, 6, 7})
+
+    def test_empty_selector_is_rejected_instead_of_restoring_everything(self):
+        mod = load_module()
+        with mock.patch.object(sys, "argv", ["ws", "restore", "demo", "--item="]), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                mod.main()
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_interactive_partial_picker_toggles_items_and_plans(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.json"
+            path.write_text(json.dumps(self.sample_data()))
+            calls = []
+            main_menu_count = 0
+
+            def menu(labels, prompt):
+                nonlocal main_menu_count
+                if prompt == "Toggle workspace":
+                    return next(label for label in labels if label.startswith("workspace 2"))
+                main_menu_count += 1
+                if main_menu_count == 1:
+                    return labels[0]
+                if main_menu_count == 2:
+                    return "Toggle workspace…"
+                return next(label for label in labels if label.startswith("Plan selected"))
+
+            mod.run_menu = menu
+            mod.restore_dry_run = lambda selected_path, selection=None: calls.append((selected_path, selection))
+            mod.partial_restore_picker(path)
+            self.assertEqual(calls[0][0], path)
+            self.assertEqual(calls[0][1]["items"], {1, 2, 3})
+
+
 class DryRunTests(unittest.TestCase):
     def test_restore_dry_run_reports_plan_without_side_effects(self):
         mod = load_module()
@@ -403,6 +490,48 @@ class DryRunTests(unittest.TestCase):
             self.assertEqual([o["status"] for o in audit["targetOutcomes"]], ["already_open", "launched_detected"])
             self.assertEqual(audit["targetOutcomes"][1]["currentAddress"], "0xc2")
 
+    def test_partial_restore_audit_and_hard_undo_record_only_selected_launches(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            session = tmp_path / "session.json"
+            session.write_text(json.dumps({
+                "windows": [
+                    {"address": "0x1", "class": "alacritty", "title": "One", "workspace": {"id": 1, "name": "1"}},
+                    {"address": "0x2", "class": "alacritty", "title": "Two", "workspace": {"id": 2, "name": "2"}},
+                ],
+            }))
+            after = [{
+                "address": "0xc2", "class": "alacritty", "title": "Two",
+                "workspace": {"id": 2, "name": "2"},
+            }]
+            collections = iter([[], after])
+            mod.collect_windows = lambda: next(collections)
+            mod.active_window = lambda: {}
+            mod.restore_workspace_monitors = lambda targets: (0, 0)
+            mod.launch_result = lambda win: "launched"
+            mod.apply_saved_state = lambda win, before_addresses: ("0xc2", 0)
+            mod.restore_groups = lambda targets, target_outcomes=None: (0, {})
+            mod.verify_saved_groups = lambda targets, assigned: []
+            mod.restore_saved_focus = lambda data, targets, assigned, fallback: (False, False)
+            mod.notify = lambda title, body="": None
+            mod.LAST_RESTORE_FILE = tmp_path / "last-restore.json"
+            mod.LAST_RESTORE_AUDIT_FILE = tmp_path / "last-restore-audit.json"
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                mod.restore(
+                    session, save_undo=False,
+                    selection={"items": {2}, "groups": set(), "workspaces": set()},
+                )
+
+            launch_record = json.loads(mod.LAST_RESTORE_FILE.read_text())
+            audit = json.loads(mod.LAST_RESTORE_AUDIT_FILE.read_text())
+            self.assertEqual([item["address"] for item in launch_record["launched"]], ["0xc2"])
+            self.assertEqual(audit["summary"]["targetCount"], 1)
+            self.assertEqual(audit["summary"]["savedTargetCount"], 2)
+            self.assertTrue(audit["summary"]["partialRestore"])
+            self.assertEqual([target["address"] for target in audit["intended"]["targets"]], ["0x2"])
+
     def test_duplicate_singleton_targets_are_reported_as_restore_limitations(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -463,7 +592,7 @@ class DryRunTests(unittest.TestCase):
         mod = load_module()
         calls = []
         mod.session_path = lambda name=None: Path(f"/tmp/{name or 'default'}.json")
-        mod.restore_dry_run = lambda path: calls.append(path)
+        mod.restore_dry_run = lambda path, selection=None: calls.append((path, selection))
         mod.restore = lambda *args, **kwargs: self.fail("real restore should not run")
         for argv in (
             ["ws", "restore", "demo", "--dry-run"],
@@ -473,7 +602,8 @@ class DryRunTests(unittest.TestCase):
         ):
             with mock.patch.object(sys, "argv", argv):
                 mod.main()
-        self.assertEqual(calls, [Path("/tmp/demo.json")] * 4)
+        self.assertEqual([path for path, _ in calls], [Path("/tmp/demo.json")] * 4)
+        self.assertTrue(all(not any(selection.values()) for _, selection in calls))
 
 
 class PiSessionDetectionTests(unittest.TestCase):
@@ -824,6 +954,42 @@ class InstallerSafetyTests(unittest.TestCase):
             self.assertTrue(ws.is_symlink())
             self.assertEqual(os.readlink(ws), "other-tool")
 
+    def test_uninstall_removes_managed_files_and_preserves_unrelated_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = home / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            subprocess.run(["bash", str(INSTALLER), "--copy"], env=env, check=True, capture_output=True, text=True)
+            unrelated = bin_dir / "restore-workspace"
+            unrelated.unlink()
+            unrelated.symlink_to("other-tool")
+
+            subprocess.run(["bash", str(INSTALLER), "--uninstall"], env=env, check=True, capture_output=True, text=True)
+
+            self.assertFalse((bin_dir / "omarchy-session").exists())
+            self.assertFalse((bin_dir / "ws").exists())
+            self.assertTrue(unrelated.is_symlink())
+            self.assertEqual(os.readlink(unrelated), "other-tool")
+
+    def test_uninstall_preserves_unrelated_main_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = home / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            command = bin_dir / "omarchy-session"
+            command.write_text("#!/bin/sh\necho unrelated\n")
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+
+            result = subprocess.run(
+                ["bash", str(INSTALLER), "--uninstall"], env=env,
+                check=True, capture_output=True, text=True,
+            )
+            self.assertIn("refusing to remove unrelated", result.stderr)
+            self.assertTrue(command.exists())
+
     def test_installer_refreshes_existing_managed_alias(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -876,6 +1042,21 @@ class IntegrationInstallerTests(unittest.TestCase):
             self.assertTrue((home / ".pi/agent/extensions/omarchy-session-registry.ts").exists())
             self.assertTrue((home / ".local/lib/omarchy-session/claude-session-registry.py").exists())
             self.assertTrue((home / ".config/opencode/plugins/omarchy-session-registry.ts").exists())
+
+            subprocess.run(
+                [sys.executable, str(INTEGRATION_INSTALLER), "--uninstall"],
+                env=env, check=True, capture_output=True, text=True,
+            )
+            claude = json.loads(claude_settings.read_text())
+            self.assertEqual(claude["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "existing-hook")
+            self.assertNotIn("SessionStart", claude["hooks"])
+            self.assertNotIn("UserPromptSubmit", claude["hooks"])
+            self.assertNotIn("SessionEnd", claude["hooks"])
+            opencode = json.loads(opencode_config.read_text())
+            self.assertEqual(opencode["plugin"], ["existing-plugin"])
+            self.assertFalse((home / ".pi/agent/extensions/omarchy-session-registry.ts").exists())
+            self.assertFalse((home / ".local/lib/omarchy-session/claude-session-registry.py").exists())
+            self.assertFalse((home / ".config/opencode/plugins/omarchy-session-registry.ts").exists())
 
 
 class GroupRestoreTests(unittest.TestCase):

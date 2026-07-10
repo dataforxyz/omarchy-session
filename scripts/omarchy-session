@@ -2220,9 +2220,107 @@ def restore_review_note(verification: dict) -> str:
     return f", restore needs review: {detail}"
 
 
-def restore_dry_run(path: Path) -> None:
+def parse_number_selection(value: str, label: str) -> set[int]:
+    selected: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            if not start_text.isdigit() or not end_text.isdigit():
+                raise ValueError(f"Invalid {label} range: {part}")
+            start, end = int(start_text), int(end_text)
+            if start < 1 or end < start:
+                raise ValueError(f"Invalid {label} range: {part}")
+            selected.update(range(start, end + 1))
+        elif part.isdigit() and int(part) >= 1:
+            selected.add(int(part))
+        else:
+            raise ValueError(f"Invalid {label}: {part}")
+    if not selected:
+        raise ValueError(f"Missing {label} value")
+    return selected
+
+
+def parse_workspace_selection(value: str) -> set[str]:
+    selected = {part.strip() for part in value.split(",") if part.strip()}
+    if not selected:
+        raise ValueError("Missing workspace value")
+    return selected
+
+
+def restore_items(data: dict) -> list[dict]:
+    return [w for w in data.get("windows", []) if workspace_spec(w) != "0"]
+
+
+def restore_group_members(targets: list[dict]) -> list[tuple[str, ...]]:
+    return saved_group_addresses(targets)
+
+
+def select_restore_targets(data: dict, selection: dict | None = None) -> tuple[list[dict], int]:
+    all_targets = [dict(win, _restoreItemIndex=index) for index, win in enumerate(restore_items(data), 1)]
+    if not selection or not any(selection.get(key) for key in ("workspaces", "groups", "items")):
+        return all_targets, len(all_targets)
+
+    selected_addresses: set[str] = set()
+    workspaces = {str(value) for value in selection.get("workspaces", set())}
+    item_indexes = set(selection.get("items", set()))
+    group_indexes = set(selection.get("groups", set()))
+
+    for index, win in enumerate(all_targets, 1):
+        if index in item_indexes or workspace_spec(win) in workspaces:
+            address = win.get("address") or ""
+            if address:
+                selected_addresses.add(address)
+
+    groups = restore_group_members(all_targets)
+    for group_index in group_indexes:
+        if group_index < 1 or group_index > len(groups):
+            raise ValueError(f"Group index out of range: {group_index}")
+        selected_addresses.update(groups[group_index - 1])
+
+    invalid_items = sorted(index for index in item_indexes if index > len(all_targets))
+    if invalid_items:
+        raise ValueError(f"Item index out of range: {invalid_items[0]}")
+    known_workspaces = {workspace_spec(win) for win in all_targets}
+    unknown_workspaces = sorted(workspaces - known_workspaces)
+    if unknown_workspaces:
+        raise ValueError(f"Workspace not found in save: {unknown_workspaces[0]}")
+
+    selected: list[dict] = []
+    for win in all_targets:
+        address = win.get("address") or ""
+        if address not in selected_addresses:
+            continue
+        copied = dict(win)
+        grouped = tuple(win.get("grouped") or [])
+        if grouped and not set(grouped).issubset(selected_addresses):
+            copied["grouped"] = []
+            copied["groupIndex"] = 0
+            copied["groupSize"] = 0
+        selected.append(copied)
+    return selected, len(all_targets)
+
+
+def selected_restore_data(data: dict, targets: list[dict], *, partial: bool = True) -> dict:
+    selected = dict(data)
+    selected["windows"] = targets
+    active = data.get("activeWindow") or {}
+    selected_addresses = {win.get("address") or "" for win in targets}
+    if partial and (active.get("address") or "") not in selected_addresses:
+        selected["activeWindow"] = {}
+    return selected
+
+
+def restore_dry_run(path: Path, selection: dict | None = None) -> None:
     data = load_session(path)
-    targets = [w for w in data.get("windows", []) if workspace_spec(w) != "0"]
+    try:
+        targets, total_targets = select_restore_targets(data, selection)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(2)
+    data = selected_restore_data(data, targets, partial=len(targets) != total_targets)
     current_windows = collect_windows()
     current_counts = Counter(restore_key(w) for w in current_windows)
     monitor_moves = workspace_monitor_moves(targets)
@@ -2234,7 +2332,8 @@ def restore_dry_run(path: Path) -> None:
     planned_actions: dict[str, str] = {}
 
     print(f"Restore dry-run{f' for {human_path(path)}' if VERBOSE else ''}")
-    print(f"Saved windows considered: {len(targets)}; current windows: {len(current_windows)}")
+    selection_note = f" selected from {total_targets}" if len(targets) != total_targets else ""
+    print(f"Saved windows considered: {len(targets)}{selection_note}; current windows: {len(current_windows)}")
     if monitor_moves:
         print("Monitor actions:")
         for ws, monitor in monitor_moves:
@@ -2247,7 +2346,7 @@ def restore_dry_run(path: Path) -> None:
         print("  none")
     for win in targets:
         key = restore_key(win)
-        label = window_summary(win)
+        label = f"{window_summary(win)} [item {win.get('_restoreItemIndex')}]"
         address = win.get("address") or ""
         if address in duplicate_singletons:
             duplicate_singletons_unsupported += 1
@@ -2343,9 +2442,14 @@ def hard_undo() -> None:
     notify("Omarchy hard undo", f"Closed {closed}; missing {missing}")
 
 
-def restore(path: Path, *, save_undo: bool = True) -> None:
+def restore(path: Path, *, save_undo: bool = True, selection: dict | None = None) -> None:
     data = load_session(path)
-    targets = [w for w in data.get("windows", []) if workspace_spec(w) != "0"]
+    try:
+        targets, total_targets = select_restore_targets(data, selection)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(2)
+    data = selected_restore_data(data, targets, partial=len(targets) != total_targets)
 
     if save_undo:
         write_session(UNDO_FILE, quiet=True)
@@ -2471,6 +2575,8 @@ def restore(path: Path, *, save_undo: bool = True) -> None:
         after_active = {}
     summary = {
         "targetCount": len(targets),
+        "savedTargetCount": total_targets,
+        "partialRestore": len(targets) != total_targets,
         "launched": launched,
         "alreadyOpen": skipped_open,
         "skipped": skipped_unknown,
@@ -2576,26 +2682,30 @@ def session_picker_mtime(path: Path) -> float:
     return -1
 
 
-def pick_session(action: str = "restore") -> None:
+def pick_session_path(prompt: str = "ws pick") -> Path:
     choices = session_choices()
     if not choices:
         print("No sessions found", file=sys.stderr)
         sys.exit(1)
     choices = sorted(choices, key=lambda choice: session_picker_mtime(choice[1]), reverse=True)
     menu_choices = [(f"{label} — {session_picker_summary(path)}", path) for label, path in choices]
-    labels = [label for label, _ in menu_choices]
-    picked = run_menu(labels, f"ws {action}")
+    picked = run_menu([label for label, _ in menu_choices], prompt)
     if not picked:
         print("No session selected", file=sys.stderr)
         sys.exit(1)
-    mapping = dict(menu_choices)
-    path = mapping.get(picked)
+    path = dict(menu_choices).get(picked)
     if not path:
         print(f"Unknown selection: {picked}", file=sys.stderr)
         sys.exit(1)
+    return path
 
+
+def pick_session(action: str = "restore") -> None:
+    path = pick_session_path(f"ws {action}")
     if action in {"restore", "r", "start"}:
         restore(path, save_undo=True)
+    elif action in {"select", "partial", "rs"}:
+        partial_restore_picker(path)
     elif action in {"list", "l", "show"}:
         list_session(path)
     elif action in {"path", "p"}:
@@ -2603,6 +2713,97 @@ def pick_session(action: str = "restore") -> None:
     else:
         print(f"Unsupported pick action: {action}", file=sys.stderr)
         sys.exit(1)
+
+
+def partial_item_label(win: dict, index: int, selected: bool) -> str:
+    mark = "x" if selected else " "
+    title = (win.get("title") or "").strip() or "(untitled)"
+    cls = win.get("class") or "(unknown)"
+    agent = win.get("agentSession") or {}
+    agent_note = f" · {agent.get('tool')} session" if agent.get("tool") else ""
+    return f"[{mark}] item {index} · ws {workspace_spec(win)} · {cls} · {title}{agent_note}"
+
+
+def toggle_scope_picker(kind: str, targets: list[dict], selected: set[int]) -> None:
+    scopes: dict[str, set[int]] = {}
+    if kind == "workspace":
+        for index, win in enumerate(targets, 1):
+            scopes.setdefault(workspace_spec(win), set()).add(index)
+    else:
+        address_to_item = {win.get("address"): index for index, win in enumerate(targets, 1)}
+        for group_index, addresses in enumerate(restore_group_members(targets), 1):
+            scopes[str(group_index)] = {address_to_item[address] for address in addresses if address in address_to_item}
+    if not scopes:
+        return
+    labels = []
+    mapping: dict[str, set[int]] = {}
+    for scope, indexes in sorted(
+        scopes.items(), key=lambda item: (0, int(item[0])) if item[0].isdigit() else (1, item[0])
+    ):
+        selected_count = len(indexes & selected)
+        label = f"{kind} {scope} · {selected_count}/{len(indexes)} selected"
+        labels.append(label)
+        mapping[label] = indexes
+    picked = run_menu(labels, f"Toggle {kind}")
+    indexes = mapping.get(picked, set())
+    if not indexes:
+        return
+    if indexes.issubset(selected):
+        selected.difference_update(indexes)
+    else:
+        selected.update(indexes)
+
+
+def partial_restore_picker(path: Path) -> None:
+    data = load_session(path)
+    targets = restore_items(data)
+    if not targets:
+        print("Selected save has no restorable windows", file=sys.stderr)
+        return
+    selected: set[int] = set()
+    while True:
+        item_labels = [partial_item_label(win, index, index in selected) for index, win in enumerate(targets, 1)]
+        actions = [
+            f"Restore selected ({len(selected)})",
+            f"Plan selected ({len(selected)})",
+            "Toggle workspace…",
+            "Toggle group…",
+            "Select all",
+            "Clear selection",
+            "Cancel",
+        ]
+        picked = run_menu(item_labels + actions, "Partial restore")
+        if not picked or picked == "Cancel":
+            return
+        if picked in item_labels:
+            index = item_labels.index(picked) + 1
+            if index in selected:
+                selected.remove(index)
+            else:
+                selected.add(index)
+            continue
+        if picked == "Toggle workspace…":
+            toggle_scope_picker("workspace", targets, selected)
+            continue
+        if picked == "Toggle group…":
+            toggle_scope_picker("group", targets, selected)
+            continue
+        if picked == "Select all":
+            selected = set(range(1, len(targets) + 1))
+            continue
+        if picked == "Clear selection":
+            selected.clear()
+            continue
+        if not selected:
+            print("No windows selected", file=sys.stderr)
+            continue
+        selection = {"items": set(selected), "workspaces": set(), "groups": set()}
+        if picked.startswith("Plan selected"):
+            restore_dry_run(path, selection)
+            return
+        if picked.startswith("Restore selected"):
+            restore(path, save_undo=True, selection=selection)
+            return
 
 
 def count_session_windows(path: Path) -> str:
@@ -2744,8 +2945,16 @@ def list_session(path: Path = SESSION_FILE) -> None:
     if VERBOSE and data.get("savedAt"):
         saved_line += f" ({data.get('savedAt')})"
     print(f"{saved_line}\n{file_line}{active_line}")
+    items = restore_items(data)
+    group_by_address: dict[str, int] = {}
+    for group_index, addresses in enumerate(restore_group_members(items), 1):
+        for address in addresses:
+            group_by_address[address] = group_index
+    item_index = 0
     for w in data.get("windows", []):
         ws = workspace_spec(w)
+        if ws != "0":
+            item_index += 1
         webapp_url, _ = browser_app_args(w)
         suffix = f" [{human_path(w.get('restoreWorkdir'))}]" if VERBOSE and w.get("restoreWorkdir") else ""
         if VERBOSE and w.get("restoreArgv"):
@@ -2754,12 +2963,15 @@ def list_session(path: Path = SESSION_FILE) -> None:
             agent = w.get("agentSession") or {}
             suffix += f" [session: {agent.get('tool')} {human_path(agent.get('id') or '')}]"
         if (w.get("groupSize") or 0) > 1:
-            suffix += f" [group tab {int(w.get('groupIndex') or 0) + 1}/{w.get('groupSize')}]"
+            group_index = group_by_address.get(w.get("address") or "")
+            group_label = f"group {group_index}, " if group_index else ""
+            suffix += f" [{group_label}tab {int(w.get('groupIndex') or 0) + 1}/{w.get('groupSize')}]"
         if w.get("monitorName"):
             suffix += f" [monitor: {w.get('monitorName')}]"
         if webapp_url:
             suffix += f" [webapp: {webapp_url}]"
-        print(f"workspace {ws}: {w.get('class')} — {w.get('title')}{suffix}")
+        prefix = f"item {item_index}: " if ws != "0" else ""
+        print(f"{prefix}workspace {ws}: {w.get('class')} — {w.get('title')}{suffix}")
 
 
 def usage() -> None:
@@ -2767,15 +2979,19 @@ def usage() -> None:
     print(f"""Usage: {prog} [-v|--verbose] <command> [name]
 
 Options:
-  -v, --verbose  include saved file paths and restore metadata
+  -v, --verbose          include saved file paths and restore metadata
+  -w, --workspace VALUE  restore only saved workspace(s), comma-separated
+  -g, --group VALUE      restore only saved group index(es), ranges allowed
+  -i, --item VALUE       restore only saved item index(es), ranges allowed
 
 Short commands:
   s [name]    save
   r [name]    restore only missing windows
   plan [name] dry-run restore plan (no dispatch, launches, writes, notifications, or sleeps)
-  l [name]    list
+  rs [name]   interactively select windows for a partial restore
+  l [name]    list (shows stable item/group indexes)
   p           profiles/named setups
-  pick        pick a profile/autosave and restore it
+  pick        pick a profile/autosave and restore it (`ws pick select` for partial)
   a           autosave now
   as          list autosaves
   u           undo/restore pre-restore state
@@ -2785,7 +3001,7 @@ Short commands:
   unknowns    list app classes skipped as unknown during restore
 
 Full commands still work:
-  save [name], restore [--dry-run|--plan] [name], plan [name], dry-run [name], list [name], profiles, pick [restore|list|path], autosave, autosaves, undo, undo-hard, status, deps, unknowns, path [name]
+  save [name], restore [selectors] [--dry-run|--plan] [name], select [name], plan [selectors] [name], dry-run [name], list [name], profiles, pick [restore|select|list|path], autosave, autosaves, undo, undo-hard, status, deps, unknowns, path [name]
 
 Current shortcuts:
 {shortcuts_help_block()}
@@ -2808,14 +3024,48 @@ def parse_global_flags(args: list[str]) -> list[str]:
     return parsed
 
 
-def parse_name_and_restore_flags(args: list[str]) -> tuple[str | None, bool]:
+def parse_name_and_restore_flags(args: list[str]) -> tuple[str | None, bool, dict]:
     name: str | None = None
     dry_run = False
-    for arg in args:
+    selection = {"workspaces": set(), "groups": set(), "items": set()}
+    index = 0
+    while index < len(args):
+        arg = args[index]
         if arg in {"--dry-run", "--plan", "-n"}:
             dry_run = True
         elif arg in {"--"}:
-            continue
+            pass
+        elif arg in {"--workspace", "-w", "--group", "-g", "--item", "-i"}:
+            if index + 1 >= len(args):
+                print(f"Missing value for {arg}", file=sys.stderr)
+                sys.exit(2)
+            index += 1
+            value = args[index]
+            try:
+                if arg in {"--workspace", "-w"}:
+                    selection["workspaces"].update(parse_workspace_selection(value))
+                elif arg in {"--group", "-g"}:
+                    selection["groups"].update(parse_number_selection(value, "group"))
+                else:
+                    selection["items"].update(parse_number_selection(value, "item"))
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                sys.exit(2)
+        elif arg.startswith("--workspace="):
+            try:
+                selection["workspaces"].update(parse_workspace_selection(arg.split("=", 1)[1]))
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                sys.exit(2)
+        elif arg.startswith("--group=") or arg.startswith("--item="):
+            option, value = arg.split("=", 1)
+            try:
+                selection["groups" if option == "--group" else "items"].update(
+                    parse_number_selection(value, "group" if option == "--group" else "item")
+                )
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                sys.exit(2)
         elif arg.startswith("-"):
             print(f"Unknown option: {arg}", file=sys.stderr)
             sys.exit(2)
@@ -2824,7 +3074,8 @@ def parse_name_and_restore_flags(args: list[str]) -> tuple[str | None, bool]:
         else:
             print(f"Unexpected extra argument: {arg}", file=sys.stderr)
             sys.exit(2)
-    return name, dry_run
+        index += 1
+    return name, dry_run, selection
 
 
 def main() -> None:
@@ -2837,6 +3088,7 @@ def main() -> None:
         "l": "list",
         "p": "profiles",
         "pk": "pick",
+        "rs": "select",
         "a": "autosave",
         "al": "autosave-loop",
         "as": "autosaves",
@@ -2846,7 +3098,7 @@ def main() -> None:
         "unk": "unknowns",
     }
     cmd = aliases.get(cmd, cmd)
-    name, dry_run = parse_name_and_restore_flags(rest)
+    name, dry_run, selection = parse_name_and_restore_flags(rest)
     if cmd == "save":
         write_session(session_path(name))
     elif cmd == "autosave":
@@ -2857,11 +3109,11 @@ def main() -> None:
         autosave_loop()
     elif cmd in {"restore", "start"}:
         if dry_run:
-            restore_dry_run(session_path(name))
+            restore_dry_run(session_path(name), selection)
         else:
-            restore(session_path(name), save_undo=True)
+            restore(session_path(name), save_undo=True, selection=selection)
     elif cmd in {"plan", "dry-run"}:
-        restore_dry_run(session_path(name))
+        restore_dry_run(session_path(name), selection)
     elif cmd == "undo":
         restore(UNDO_FILE, save_undo=False)
     elif cmd in {"undo-hard", "hard-undo"}:
@@ -2880,6 +3132,9 @@ def main() -> None:
         list_profiles()
     elif cmd == "pick":
         pick_session(name or "restore")
+    elif cmd in {"select", "partial"}:
+        path = session_path(name) if name else pick_session_path("ws select")
+        partial_restore_picker(path)
     elif cmd in {"autosaves", "list-autosaves"}:
         list_autosaves()
     elif cmd == "path":

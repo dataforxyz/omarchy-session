@@ -9,10 +9,11 @@ SRC="$SCRIPT_DIR/omarchy-session"
 BIN_DIR="${HOME}/.local/bin"
 MODE="copy"
 FORCE=0
+UNINSTALL=0
 
 usage() {
     cat <<'USAGE'
-Usage: scripts/install-omarchy-session.sh [--copy|--link] [--force]
+Usage: scripts/install-omarchy-session.sh [--copy|--link] [--force|--uninstall]
 
 Installs scripts/omarchy-session to ~/.local/bin/omarchy-session and refreshes
 short aliases:
@@ -21,6 +22,7 @@ short aliases:
 
 --copy is the default and is safest for restored machines.
 --link keeps ~/.local/bin/omarchy-session pointed at this git checkout.
+--uninstall removes omarchy-session and only the shortcuts managed by it.
 
 By default, existing ws/restore-workspace aliases are refreshed only when they
 are absent or already point to omarchy-session. Unrelated existing files or
@@ -34,6 +36,7 @@ while [[ $# -gt 0 ]]; do
         --copy) MODE="copy" ;;
         --link) MODE="link" ;;
         --force) FORCE=1 ;;
+        --uninstall) UNINSTALL=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -56,6 +59,15 @@ alias_points_to_omarchy_session() {
     return 1
 }
 
+binary_is_managed() {
+    local dest="$1"
+    if [[ -L "$dest" ]]; then
+        [[ "$(basename "$(readlink "$dest")")" == "omarchy-session" ]]
+        return
+    fi
+    [[ -f "$dest" ]] && grep -Fq 'SESSION_FILE = STATE_DIR / "last-session.json"' "$dest"
+}
+
 install_alias() {
     local name="$1"
     local dest="$BIN_DIR/$name"
@@ -73,6 +85,26 @@ install_alias() {
         echo "Created $dest -> omarchy-session"
     fi
 }
+
+if [[ "$UNINSTALL" -eq 1 ]]; then
+    for name in ws restore-workspace; do
+        dest="$BIN_DIR/$name"
+        if alias_points_to_omarchy_session "$dest"; then
+            rm -f "$dest"
+            echo "Removed managed shortcut: $dest"
+        fi
+    done
+    if [[ -e "$BIN_DIR/omarchy-session" || -L "$BIN_DIR/omarchy-session" ]]; then
+        if binary_is_managed "$BIN_DIR/omarchy-session"; then
+            rm -f "$BIN_DIR/omarchy-session"
+            echo "Removed $BIN_DIR/omarchy-session"
+        else
+            echo "Warning: refusing to remove unrelated $BIN_DIR/omarchy-session" >&2
+        fi
+    fi
+    echo "Saved state under ~/.local/state/omarchy-session was left intact."
+    exit 0
+fi
 
 mkdir -p "$BIN_DIR"
 if [[ "$MODE" == "link" ]]; then

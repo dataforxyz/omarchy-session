@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Syntax checks
+        run: |
+          python -m py_compile scripts/omarchy-session scripts/install-agent-integrations.py integrations/claude-session-registry.py
+          bash -n scripts/install-omarchy-session.sh
+          shellcheck scripts/install-omarchy-session.sh
+      - name: Unit tests
+        run: python -W error::ResourceWarning -m unittest -v tests.test_omarchy_session
