@@ -34,6 +34,16 @@ repo copy:
 scripts/install-omarchy-session.sh --link
 ```
 
+For authoritative live Pi, Claude Code, and OpenCode session IDs, install the
+optional integrations:
+
+```bash
+scripts/install-agent-integrations.py
+```
+
+The integration installer preserves existing JSON configuration and creates
+backups before adding Claude hooks or the OpenCode plugin.
+
 The installer does not replace unrelated existing `~/.local/bin/ws` or
 `~/.local/bin/restore-workspace` entries by default. It refreshes aliases that
 are missing or already point to `omarchy-session`; pass `--force` to replace
@@ -130,11 +140,11 @@ Terminal restore behavior is best effort:
 - direct or wrapped OpenCode sessions restore with the saved `ses_*` id when the
   local OpenCode version accepts it, otherwise they fall back to plain `opencode`;
 - for all four agents, an explicit session argument in the live process wins.
-  Otherwise candidates are ranked by recorded activity near process start and
-  assigned once per save, preventing same-cwd windows from reusing one session.
-  Codex subagent threads and OpenCode child sessions are excluded. If no unique
-  candidate remains, restore opens the agent picker (or plain OpenCode) rather
-  than silently continuing whichever session happens to be latest. Wrappers can
+  Otherwise exact PID-to-session data comes from the optional Pi extension,
+  Claude Code hooks, Codex's local log database, or the OpenCode plugin. Runtime
+  registry records are validated against Linux process start ticks to reject
+  stale files and PID reuse. No cwd/time/latest heuristic is used; without an
+  exact mapping, restore opens the agent picker (or plain OpenCode). Wrappers can
   advertise restore commands with `OMARCHY_SESSION_PI_COMMAND`,
   `OMARCHY_SESSION_CLAUDE_COMMAND`, `OMARCHY_SESSION_CODEX_COMMAND`, or
   `OMARCHY_SESSION_OPENCODE_COMMAND`;

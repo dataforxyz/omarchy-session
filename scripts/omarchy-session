@@ -29,6 +29,10 @@ PI_SESSION_ROOT = Path.home() / ".pi/agent/sessions"
 CLAUDE_PROJECT_ROOT = Path.home() / ".claude/projects"
 CODEX_SESSION_ROOT = Path.home() / ".codex/sessions"
 OPENCODE_DB = Path.home() / ".local/share/opencode/opencode.db"
+AGENT_REGISTRY_DIRNAME = "omarchy-session/agents"
+PI_REGISTRY_EXTENSION = Path.home() / ".pi/agent/extensions/omarchy-session-registry.ts"
+CLAUDE_REGISTRY_HOOK = Path.home() / ".local/lib/omarchy-session/claude-session-registry.py"
+OPENCODE_REGISTRY_PLUGIN = Path.home() / ".config/opencode/plugins/omarchy-session-registry.ts"
 MAKE_RESTORE_TARGETS = {"ssh", "pi", "claude", "codex", "opencode"}
 DIRECT_RESTORE_COMMANDS = {"ssh", "tmux", "claude", "codex", "opencode"}
 EXCLUDED_CLASSES = {"zenity", "pinentry", "org.gnome.polkit", "xdg-desktop-portal"}
@@ -86,6 +90,15 @@ def dependency_status() -> None:
         present_text = ", ".join(present) if present else "none"
         missing_text = ", ".join(missing) if missing else "none"
         print(f"  optional: {group:<24} present: {present_text}; missing: {missing_text}")
+
+    integrations = {
+        "Pi exact-session extension": PI_REGISTRY_EXTENSION.exists(),
+        "Claude exact-session hook": CLAUDE_REGISTRY_HOOK.exists(),
+        "Codex PID/thread logs": (Path.home() / ".codex/logs_2.sqlite").exists(),
+        "OpenCode exact-session plugin": OPENCODE_REGISTRY_PLUGIN.exists(),
+    }
+    for name, installed in integrations.items():
+        print(f"  integration: {name:<27} {'installed' if installed else 'not installed'}")
 
     if missing_required:
         print("\nMissing required commands prevent save/restore from reading Hyprland state.", file=sys.stderr)
@@ -185,11 +198,6 @@ def pi_sessions_for_cwd(cwd: str) -> list[str]:
     return [str(p) for p in sorted(sessions, key=lambda p: p.stat().st_mtime, reverse=True)]
 
 
-def latest_pi_session_for_cwd(cwd: str) -> str:
-    sessions = pi_sessions_for_cwd(cwd)
-    return sessions[0] if sessions else ""
-
-
 def all_pi_sessions() -> list[str]:
     if not PI_SESSION_ROOT.exists():
         return []
@@ -271,22 +279,35 @@ def argv_has_pi_continue(argv: list[str]) -> bool:
     return False
 
 
-def proc_start_time(pid: int) -> float:
+def proc_start_ticks(pid: int) -> int:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(errors="ignore")
-        rest = stat.rsplit(") ", 1)[1].split()
-        start_ticks = int(rest[19])
-        ticks_per_second = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-        btime = 0
-        for line in Path("/proc/stat").read_text(errors="ignore").splitlines():
-            if line.startswith("btime "):
-                btime = int(line.split()[1])
-                break
-        if not btime:
-            return 0
-        return btime + (start_ticks / ticks_per_second)
+        return int(stat.rsplit(") ", 1)[1].split()[19])
     except Exception:
         return 0
+
+
+def agent_registry_root(env: dict[str, str] | None = None) -> Path:
+    env = env or os.environ
+    runtime_dir = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return Path(runtime_dir) / AGENT_REGISTRY_DIRNAME
+
+
+def agent_registry_record(tool: str, pid: int, env: dict[str, str] | None = None) -> dict:
+    path = agent_registry_root(env) / tool / f"{pid}.json"
+    try:
+        record = json.loads(path.read_text())
+    except Exception:
+        return {}
+    if record.get("tool") != tool or record.get("pid") != pid:
+        return {}
+    saved_ticks = int(record.get("processStartTicks") or 0)
+    if not saved_ticks or saved_ticks != proc_start_ticks(pid):
+        return {}
+    session_id = record.get("sessionId") or ""
+    if not session_id:
+        return {}
+    return record
 
 
 def timestamp_epoch(value) -> float:
@@ -299,51 +320,6 @@ def timestamp_epoch(value) -> float:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except Exception:
         return 0
-
-
-def jsonl_activity_distance(path: Path | str, process_start: float) -> float:
-    """Closest recorded JSONL event timestamp to a process start time."""
-    if not process_start:
-        return float("inf")
-    best = float("inf")
-    try:
-        with Path(path).open(errors="ignore") as handle:
-            for line in handle:
-                if "timestamp" not in line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except Exception:
-                    continue
-                values = [record.get("timestamp")]
-                payload = record.get("payload") or {}
-                if isinstance(payload, dict):
-                    values.append(payload.get("timestamp"))
-                for value in values:
-                    event_time = timestamp_epoch(value)
-                    if event_time:
-                        best = min(best, abs(event_time - process_start))
-                        if best < 0.5:
-                            return best
-    except Exception:
-        pass
-    return best
-
-
-def session_process_score(path: Path | str, process_start: float, created_at: float = 0) -> tuple[float, float]:
-    path = Path(path)
-    try:
-        mtime = path.stat().st_mtime
-    except Exception:
-        mtime = 0
-    if not process_start:
-        return (float("inf"), -mtime)
-    distances = [jsonl_activity_distance(path, process_start)]
-    if created_at:
-        distances.append(abs(created_at - process_start))
-    if mtime:
-        distances.append(abs(mtime - process_start))
-    return (min(distances), -mtime)
 
 
 def command_tail(argv: list[str], command: str) -> list[str]:
@@ -361,140 +337,6 @@ def option_value(args: list[str], names: set[str]) -> str:
             if arg.startswith(name + "="):
                 return arg.split("=", 1)[1]
     return ""
-
-
-def pi_session_created_at(session: str) -> float:
-    match = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z_", Path(session).name)
-    if match:
-        date, hour, minute, second, millis = match.groups()
-        try:
-            dt = datetime.fromisoformat(f"{date}T{hour}:{minute}:{second}.{millis}+00:00")
-            return dt.timestamp()
-        except Exception:
-            pass
-    try:
-        return Path(session).stat().st_ctime
-    except Exception:
-        return 0
-
-
-def pi_sessions_for_process(cwd: str, pid: int) -> list[str]:
-    sessions = pi_sessions_for_cwd(cwd)
-    start = proc_start_time(pid)
-    if not sessions or not start:
-        return sessions
-
-    return sorted(
-        sessions,
-        key=lambda session: session_process_score(session, start, pi_session_created_at(session)),
-    )
-
-
-def pi_title_label(title: str) -> str:
-    title = title.strip()
-    if not title.lower().startswith("pi - "):
-        return ""
-    label = title[5:].split(":", 1)[0].strip().lower()
-    return label
-
-
-def pi_session_cwd(session: str) -> str:
-    try:
-        with Path(session).open(errors="ignore") as handle:
-            first = handle.readline()
-        meta = json.loads(first)
-        cwd = meta.get("cwd") or (meta.get("payload") or {}).get("cwd") or ""
-        return cwd if cwd and Path(cwd).is_dir() else ""
-    except Exception:
-        return ""
-
-
-def pi_sessions_matching_label(label: str) -> list[str]:
-    if not label or not PI_SESSION_ROOT.exists():
-        return []
-    matches: list[Path] = []
-    needle = label.lower()
-    try:
-        session_dirs = [p for p in PI_SESSION_ROOT.iterdir() if p.is_dir()]
-    except Exception:
-        return []
-    home_prefix = "--" + str(Path.home()).strip("/").replace("/", "-")
-    for session_dir in session_dirs:
-        name = session_dir.name.lower()
-        if not name.startswith(home_prefix.lower()) or needle not in name:
-            continue
-        try:
-            matches.extend(p for p in session_dir.glob("*.jsonl") if p.is_file())
-        except Exception:
-            continue
-    return [str(p) for p in sorted(matches, key=lambda p: p.stat().st_mtime, reverse=True)]
-
-
-def legacy_pi_session_candidates(win: dict) -> list[str]:
-    """Best-effort Pi session candidates for old saves lacking agentSession.
-
-    Alacritty support was added after some session files were already saved, so
-    those records only have the title/cwd. Prefer exact cwd sessions except when
-    the saved cwd is the home directory and the title names a project; in that
-    common case the terminal process cwd was generic but the Pi title still has
-    the useful project label.
-    """
-    title = win.get("title") or ""
-    label = pi_title_label(title)
-    if not label:
-        return []
-
-    workdir = win.get("restoreWorkdir") or ""
-    home = str(Path.home())
-    cwd_sessions = pi_sessions_for_cwd(workdir) if workdir else []
-    title_sessions = pi_sessions_matching_label(label)
-    basename = Path(workdir).name.lower() if workdir else ""
-
-    ordered: list[str] = []
-    if workdir == home and label != basename:
-        ordered.extend(title_sessions)
-        ordered.extend(cwd_sessions)
-    else:
-        ordered.extend(cwd_sessions)
-        if not cwd_sessions:
-            ordered.extend(title_sessions)
-
-    return list(dict.fromkeys(ordered))
-
-
-def choose_unused_session(tool: str, sessions: list[str], used_sessions: dict[str, set[str]]) -> str:
-    used = used_sessions.setdefault(tool, set())
-    for session in sessions:
-        if session not in used:
-            used.add(session)
-            return session
-    # Reusing a consumed candidate silently opens the wrong conversation when
-    # multiple windows share a cwd. An empty result lets the caller use a picker
-    # or a plain-tool fallback instead of duplicating another window's session.
-    return ""
-
-
-def claude_project_dir_for_cwd(cwd: str, project_root: Path = CLAUDE_PROJECT_ROOT) -> Path:
-    # Claude Code stores sessions by cwd with non-alphanumeric characters
-    # replaced by '-': /home/me/src/foo.bar -> -home-me-src-foo-bar.
-    return project_root / re.sub(r"[^A-Za-z0-9]", "-", cwd)
-
-
-def claude_sessions_for_cwd(cwd: str, project_root: Path = CLAUDE_PROJECT_ROOT) -> list[Path]:
-    session_dir = claude_project_dir_for_cwd(cwd, project_root)
-    try:
-        sessions = [p for p in session_dir.glob("*.jsonl") if p.is_file()]
-    except Exception:
-        return []
-    return sorted(sessions, key=lambda p: p.stat().st_mtime, reverse=True)
-
-
-def claude_sessions_for_process(cwd: str, pid: int, project_root: Path = CLAUDE_PROJECT_ROOT) -> list[str]:
-    sessions = claude_sessions_for_cwd(cwd, project_root)
-    start = proc_start_time(pid)
-    if start:
-        sessions.sort(key=lambda path: session_process_score(path, start))
-    return [path.stem for path in sessions]
 
 
 def explicit_claude_session_from_argv(argv: list[str]) -> str:
@@ -548,6 +390,39 @@ def codex_session_root_from_env(env: dict[str, str]) -> Path:
     return Path(codex_home).expanduser() / "sessions" if codex_home else CODEX_SESSION_ROOT
 
 
+def codex_log_db_from_env(env: dict[str, str]) -> Path:
+    codex_home = env.get("CODEX_HOME") or str(Path.home() / ".codex")
+    return Path(codex_home).expanduser() / "logs_2.sqlite"
+
+
+def codex_session_from_process_logs(pid: int, cwd: str, env: dict[str, str]) -> str:
+    """Read Codex's authoritative PID-to-thread mapping from its log database."""
+    db_path = codex_log_db_from_env(env)
+    if not db_path.exists():
+        return ""
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        rows = conn.execute(
+            """
+            select thread_id from logs
+            where process_uuid like ? and thread_id is not null
+            group by thread_id
+            order by max(id) desc
+            """,
+            (f"pid:{pid}:%",),
+        ).fetchall()
+    except Exception:
+        return ""
+    finally:
+        if conn is not None:
+            conn.close()
+
+    session_root = codex_session_root_from_env(env)
+    top_level = {session_id for _, session_id, _ in codex_sessions_for_cwd(cwd, session_root)}
+    return next((thread_id for (thread_id,) in rows if thread_id in top_level), "")
+
+
 def codex_session_metadata(path: Path) -> tuple[str, str, float] | None:
     try:
         with path.open(errors="ignore") as handle:
@@ -580,14 +455,6 @@ def codex_sessions_for_cwd(cwd: str, session_root: Path = CODEX_SESSION_ROOT) ->
     return sessions
 
 
-def codex_sessions_for_process(cwd: str, pid: int, session_root: Path = CODEX_SESSION_ROOT) -> list[str]:
-    sessions = codex_sessions_for_cwd(cwd, session_root)
-    start = proc_start_time(pid)
-    if start:
-        sessions.sort(key=lambda item: session_process_score(item[0], start, item[2]))
-    return [session_id for _, session_id, _ in sessions]
-
-
 def explicit_codex_session_from_argv(argv: list[str]) -> str:
     args = command_tail(argv, "codex")
     for i, arg in enumerate(args):
@@ -599,41 +466,6 @@ def explicit_codex_session_from_argv(argv: list[str]) -> str:
 def opencode_db_from_env(env: dict[str, str]) -> Path:
     data_home = env.get("XDG_DATA_HOME") or ""
     return Path(data_home).expanduser() / "opencode/opencode.db" if data_home else OPENCODE_DB
-
-
-def opencode_sessions_for_process(cwd: str, pid: int, db_path: Path = OPENCODE_DB) -> list[str]:
-    if not db_path.exists():
-        return []
-    start_ms = int(proc_start_time(pid) * 1000)
-    conn = None
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        rows = conn.execute(
-            """
-            select id, time_created, time_updated from session
-            where parent_id is null and (directory = ? or path = ?)
-            order by time_updated desc
-            """,
-            (cwd, cwd),
-        ).fetchall()
-        if not start_ms:
-            return [row[0] for row in rows]
-        scored = []
-        for session_id, created, updated in rows:
-            activity = conn.execute(
-                "select min(abs(time_created - ?)) from message where session_id = ?",
-                (start_ms, session_id),
-            ).fetchone()[0]
-            distances = [abs(created - start_ms), abs(updated - start_ms)]
-            if activity is not None:
-                distances.append(activity)
-            scored.append((min(distances), -updated, session_id))
-        return [session_id for _, _, session_id in sorted(scored)]
-    except Exception:
-        return []
-    finally:
-        if conn is not None:
-            conn.close()
 
 
 def explicit_opencode_session_from_argv(argv: list[str]) -> str:
@@ -658,9 +490,48 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
     restore_session: dict = {}
     kids = sorted(descendants(pid, children), key=lambda item: item[1])
 
-    # Prefer exact local agent resumes when the tool exposes a stable resume
-    # mechanism. This beats rerunning `make claude`/`make codex` because it opens
-    # the saved conversation instead of starting a fresh one.
+    # Integrations publish authoritative PID-to-session records. Prefer those
+    # over argv parsing and never replace them with cwd/time-based guesses.
+    for child_pid, depth in kids:
+        env = read_proc_environ(child_pid)
+        process_cwd = read_proc_cwd(child_pid) or fallback
+        for tool in ("pi", "claude", "opencode"):
+            record = agent_registry_record(tool, child_pid, env)
+            if not record:
+                continue
+            workdir = record.get("cwd") or process_cwd
+            session_id = record.get("sessionId") or ""
+            if tool == "pi":
+                session_file = record.get("sessionFile") or ""
+                if not session_file or not Path(session_file).is_file():
+                    continue
+                command = pi_command_from_env(env)
+                used_sessions.setdefault("pi", set()).add(session_file)
+                return workdir, [command, "--session", session_file], {
+                    "tool": "pi", "id": session_id, "path": session_file,
+                    "command": command, "match": "pid-registry",
+                }
+            if tool == "claude":
+                command = claude_command_from_env(env)
+                project_root = claude_project_root_from_env(env)
+                used_sessions.setdefault(f"claude:{project_root}", set()).add(session_id)
+                return workdir, [command, "--resume", session_id], {
+                    "tool": "claude", "id": session_id, "command": command,
+                    "projectRoot": str(project_root), "match": "pid-registry",
+                }
+            if tool == "opencode":
+                command = opencode_command_from_env(env)
+                db_path = opencode_db_from_env(env)
+                used_sessions.setdefault(f"opencode:{db_path}", set()).add(session_id)
+                quoted_command = shlex.quote(command)
+                cmd = f"{quoted_command} --session {shlex.quote(session_id)} || {quoted_command}"
+                return workdir, ["sh", "-lc", cmd], {
+                    "tool": "opencode", "id": session_id, "command": command,
+                    "database": str(db_path), "match": "pid-registry",
+                }
+
+    # Explicit session arguments are authoritative. If neither an integration
+    # record nor an explicit argument exists, use a picker instead of guessing.
     for child_pid, depth in kids:
         cwd = read_proc_cwd(child_pid)
         if not cwd:
@@ -680,12 +551,6 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
                     "tool": "pi", "id": explicit_session, "path": explicit_session,
                     "command": command, "match": "argv-session",
                 }
-            session = choose_unused_session("pi", pi_sessions_for_process(cwd, child_pid), used_sessions)
-            if session:
-                return cwd, [command, "--session", session], {
-                    "tool": "pi", "id": session, "path": session,
-                    "command": command, "match": "process-activity",
-                }
             if argv_has_pi_continue(argv) or exe == "pi":
                 return cwd, [command, "--resume"], {
                     "tool": "pi", "id": "picker", "command": command,
@@ -700,19 +565,9 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
             explicit_session = explicit_claude_session_from_argv(argv)
             if explicit_session:
                 used_sessions.setdefault(used_key, set()).add(explicit_session)
-                session = explicit_session
-                match = "argv-session"
-            else:
-                session = choose_unused_session(
-                    used_key,
-                    claude_sessions_for_process(cwd, child_pid, project_root),
-                    used_sessions,
-                )
-                match = "process-activity"
-            if session:
-                return cwd, [command, "--resume", session], {
-                    "tool": "claude", "id": session, "command": command,
-                    "projectRoot": str(project_root), "match": match,
+                return cwd, [command, "--resume", explicit_session], {
+                    "tool": "claude", "id": explicit_session, "command": command,
+                    "projectRoot": str(project_root), "match": "argv-session",
                 }
             return cwd, [command, "--resume"], {
                 "tool": "claude", "id": "picker", "command": command,
@@ -730,13 +585,10 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
                 session = explicit_session
                 match = "argv-session"
             else:
-                session = choose_unused_session(
-                    used_key,
-                    codex_sessions_for_process(cwd, child_pid, session_root),
-                    used_sessions,
-                )
-                match = "process-activity"
+                session = codex_session_from_process_logs(child_pid, cwd, env)
+                match = "pid-log"
             if session:
+                used_sessions.setdefault(used_key, set()).add(session)
                 return cwd, [command, "resume", session], {
                     "tool": "codex", "id": session, "command": command,
                     "sessionRoot": str(session_root), "match": match,
@@ -757,12 +609,8 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
                 session = explicit_session
                 match = "argv-session"
             else:
-                session = choose_unused_session(
-                    used_key,
-                    opencode_sessions_for_process(cwd, child_pid, db_path),
-                    used_sessions,
-                )
-                match = "process-activity"
+                session = ""
+                match = "plain-fallback"
             if session:
                 # OpenCode's session store exposes stable ses_* IDs. Some
                 # versions accept --session; if a future/older wrapper rejects
@@ -1971,23 +1819,6 @@ def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str
     return False, attempted
 
 
-def enrich_legacy_terminal_targets(targets: list[dict]) -> None:
-    used_sessions: dict[str, set[str]] = {}
-    for win in targets:
-        if lc_class(win) not in TERMINAL_CLASSES:
-            continue
-        if win.get("restoreArgv") or (win.get("agentSession") or {}).get("id"):
-            continue
-        session = choose_unused_session("pi", legacy_pi_session_candidates(win), used_sessions)
-        if session:
-            win["restoreArgv"] = ["pi", "--session", session]
-            win["agentSession"] = {"tool": "pi", "id": session, "path": session, "match": "legacy-title-cwd"}
-            win["piSession"] = session
-            session_cwd = pi_session_cwd(session)
-            if session_cwd:
-                win["restoreWorkdir"] = session_cwd
-
-
 def terminal_restore_argv(win: dict) -> list[str]:
     restore_argv = win.get("restoreArgv") or []
     if restore_argv:
@@ -2014,11 +1845,11 @@ def terminal_restore_argv(win: dict) -> list[str]:
     # agent in the saved cwd rather than dropping the user into an empty shell.
     title = (win.get("title") or "").strip().lower()
     if title.startswith("pi - "):
-        return ["pi"]
+        return ["pi", "--resume"]
     if title.startswith("claude"):
-        return ["claude"]
+        return ["claude", "--resume"]
     if title.startswith("codex"):
-        return ["codex"]
+        return ["codex", "resume"]
     if title.startswith("opencode"):
         return ["opencode"]
     return []
@@ -2392,7 +2223,6 @@ def restore_review_note(verification: dict) -> str:
 def restore_dry_run(path: Path) -> None:
     data = load_session(path)
     targets = [w for w in data.get("windows", []) if workspace_spec(w) != "0"]
-    enrich_legacy_terminal_targets(targets)
     current_windows = collect_windows()
     current_counts = Counter(restore_key(w) for w in current_windows)
     monitor_moves = workspace_monitor_moves(targets)
@@ -2516,7 +2346,6 @@ def hard_undo() -> None:
 def restore(path: Path, *, save_undo: bool = True) -> None:
     data = load_session(path)
     targets = [w for w in data.get("windows", []) if workspace_spec(w) != "0"]
-    enrich_legacy_terminal_targets(targets)
 
     if save_undo:
         write_session(UNDO_FILE, quiet=True)

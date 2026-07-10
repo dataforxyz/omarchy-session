@@ -59,6 +59,16 @@ For development, link the installed command to the checkout:
 scripts/install-omarchy-session.sh --link
 ```
 
+Install the optional agent integrations for authoritative live-session IDs:
+
+```bash
+scripts/install-agent-integrations.py
+```
+
+This installs a Pi extension, Claude Code hooks, and an OpenCode plugin. Existing
+Claude/OpenCode JSON configuration is preserved and backed up before changes.
+Use `--pi`, `--claude`, or `--opencode` to install only one integration.
+
 ## Quick start
 
 ```bash
@@ -124,13 +134,19 @@ metadata is available:
 - Codex: `codex resume <id>`
 - OpenCode: its saved `ses_*` identifier when supported
 
-Session matching first preserves an explicit ID already present in the running
-process arguments. Otherwise it compares process start time with recorded session
-activity and assigns each terminal an unused candidate, so multiple windows in
-the same directory do not all receive the same conversation. Codex subagent
-threads and OpenCode child sessions are excluded. If no unique match is safe, the
-tool opens the agent's session picker (or plain OpenCode) instead of silently
-resuming another window's latest session.
+Session matching does not guess from cwd, timestamps, or “latest” state. It uses
+only authoritative sources:
+
+- an explicit session ID already present in the process arguments;
+- the Pi extension's PID-to-session registry;
+- Claude Code's hook-provided session ID registry;
+- Codex's PID-to-thread records in its local log database;
+- the OpenCode plugin's active-session registry.
+
+Registry records include Linux process start ticks so stale files and reused PIDs
+are rejected. If no exact mapping exists, Pi, Claude, and Codex open their session
+picker; OpenCode opens normally. The tool never silently substitutes a guessed
+conversation.
 
 A wrapper that eventually executes an agent can advertise the command that
 should be used during restore. Export the corresponding variable before `exec`
