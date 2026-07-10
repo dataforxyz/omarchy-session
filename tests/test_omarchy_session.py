@@ -829,6 +829,31 @@ class SessionActionMenuTests(unittest.TestCase):
 
         self.assertEqual(calls, [(Path("/tmp/coding.json"), {"3"})])
 
+    def test_super_space_submenu_previews_a_picked_profile_or_autosave(self):
+        mod = load_module()
+        selected_path = Path("/tmp/autosaves/selected.json")
+        mod.run_menu = lambda labels, prompt: next(
+            label for label in labels if "Preview profile or autosave" in label
+        )
+        mod.pick_session_path = lambda prompt: selected_path
+        calls = []
+        mod.open_command_terminal = lambda *args: calls.append(args)
+
+        mod.session_action_menu()
+
+        self.assertEqual(calls, [("plan-path", str(selected_path))])
+
+    def test_pick_plan_runs_a_dry_run_for_the_selected_file(self):
+        mod = load_module()
+        selected_path = Path("/tmp/profiles/work.json")
+        mod.pick_session_path = lambda prompt: selected_path
+        calls = []
+        mod.restore_dry_run = lambda path, selection=None: calls.append(path)
+
+        mod.pick_session("plan")
+
+        self.assertEqual(calls, [selected_path])
+
     def test_super_space_submenu_routes_to_partial_restore(self):
         mod = load_module()
         selected_path = Path("/tmp/work.json")
