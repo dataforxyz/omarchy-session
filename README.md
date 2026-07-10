@@ -289,9 +289,9 @@ Always preview an unfamiliar or old save first:
 ws plan work
 ```
 
-From the Super+Space **Workspace Sessions** submenu, use **Preview profile or
-autosave…** to pick any save before opening its plan. The terminal equivalent is
-`ws pick plan`; **Preview default plan** remains as the one-click default option.
+From the Super+Space **Workspace Sessions** submenu, use **Preview restore
+plan…** to choose default, any named profile, or an autosave before opening its
+plan. The terminal equivalent is `ws pick plan`.
 
 Dry-run mode does not launch applications, dispatch Hyprland commands, write
 undo/restore state, send notifications, or sleep between launches.
