@@ -965,13 +965,32 @@ def list_unknown_classes() -> None:
             print(f"  workspace {workspace}: {title}{source}")
 
 
-def write_session(path: Path, *, quiet: bool = False) -> None:
+def windows_for_workspace_save(windows: list[dict], workspaces: set[str]) -> list[dict]:
+    selected = [dict(win) for win in windows if workspace_spec(win) in workspaces]
+    selected_addresses = {win.get("address") or "" for win in selected}
+    for win in selected:
+        grouped = set(win.get("grouped") or [])
+        if grouped and not grouped.issubset(selected_addresses):
+            win["grouped"] = []
+            win["groupIndex"] = 0
+            win["groupSize"] = 0
+    return selected
+
+
+def write_session(path: Path, *, quiet: bool = False, workspaces: set[str] | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     windows = collect_windows()
+    if workspaces:
+        windows = windows_for_workspace_save(windows, {str(workspace) for workspace in workspaces})
+        if not windows:
+            raise ValueError(f"No windows found on workspace {', '.join(sorted(workspaces))}")
+    active = active_session_snapshot(windows)
+    if workspaces and (active.get("address") or "") not in {win.get("address") for win in windows}:
+        active = {}
     data = {
         "savedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "host": os.environ.get("HOSTNAME", ""),
-        "activeWindow": active_session_snapshot(windows),
+        "activeWindow": active,
         "windows": windows,
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -2879,6 +2898,26 @@ def run_menu(labels: list[str], prompt: str) -> str:
     return ""
 
 
+def run_input(prompt: str) -> str:
+    commands = [
+        ["omarchy-menu-input", prompt],
+        ["walker", "--dmenu", "--inputonly", "--width", "360", "--minheight", "1", "--maxheight", "1", "-p", f"{prompt}…"],
+    ]
+    for command in commands:
+        if not shutil.which(command[0]):
+            continue
+        try:
+            result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except Exception:
+            continue
+        if result.returncode == 0:
+            return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+        return ""
+    if sys.stdin.isatty():
+        return input(f"{prompt}: ").strip()
+    return ""
+
+
 def session_picker_mtime(path: Path) -> float:
     try:
         if path.exists() or path.is_symlink():
@@ -3024,9 +3063,38 @@ def open_command_terminal(*args: str) -> None:
         subprocess.Popen([command, *args], start_new_session=True)
 
 
+def save_workspace_picker() -> None:
+    windows = collect_windows()
+    counts = Counter(workspace_spec(win) for win in windows if workspace_spec(win) != "0")
+    if not counts:
+        notify("Omarchy session", "No workspace windows found")
+        return
+    labels: list[str] = []
+    mapping: dict[str, str] = {}
+    for workspace, count in sorted(
+        counts.items(), key=lambda item: (0, int(item[0])) if item[0].isdigit() else (1, item[0])
+    ):
+        label = f"Workspace {workspace} · {plural(count, 'window')}"
+        labels.append(label)
+        mapping[label] = workspace
+    picked = run_menu(labels, "Save workspace")
+    workspace = mapping.get(picked, "")
+    if not workspace:
+        return
+    name = run_input(f"Profile name for workspace {workspace}")
+    if not name:
+        return
+    try:
+        write_session(session_path(name), workspaces={workspace})
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        notify("Omarchy session save failed", str(exc))
+
+
 def session_action_menu() -> None:
     options = [
         "󰆓  Save current layout",
+        "󰉋  Save one workspace as profile…",
         "󰑓  Restore default",
         "󰩭  Restore selected…",
         "󰍉  Choose profile or autosave…",
@@ -3043,6 +3111,8 @@ def session_action_menu() -> None:
         return
     if "Save current" in picked:
         write_session(SESSION_FILE)
+    elif "Save one workspace" in picked:
+        save_workspace_picker()
     elif "Restore default" in picked:
         restore(SESSION_FILE, save_undo=True)
     elif "Restore selected" in picked:
@@ -3245,12 +3315,12 @@ def usage() -> None:
 
 Options:
   -v, --verbose          include saved file paths and restore metadata
-  -w, --workspace VALUE  restore only saved workspace(s), comma-separated
+  -w, --workspace VALUE  save/restore only workspace(s), comma-separated
   -g, --group VALUE      restore only saved group index(es), ranges allowed
   -i, --item VALUE       restore only saved item index(es), ranges allowed
 
 Short commands:
-  s [name]    save
+  s [name]    save (use `ws s name --workspace 3` for a workspace-only profile)
   r [name]    restore only missing windows
   plan [name] dry-run restore plan (no dispatch, launches, writes, notifications, or sleeps)
   rs [name]   interactively select windows for a partial restore
@@ -3366,7 +3436,14 @@ def main() -> None:
     cmd = aliases.get(cmd, cmd)
     name, dry_run, selection = parse_name_and_restore_flags(rest)
     if cmd == "save":
-        write_session(session_path(name))
+        if selection["items"] or selection["groups"]:
+            print("Save supports --workspace, but not --item or --group", file=sys.stderr)
+            sys.exit(2)
+        try:
+            write_session(session_path(name), workspaces=selection["workspaces"] or None)
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            sys.exit(2)
     elif cmd == "autosave":
         path = autosave_once(quiet=True)
         target = f" ({human_path(path)})" if VERBOSE else ""

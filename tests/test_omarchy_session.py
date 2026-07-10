@@ -781,7 +781,54 @@ class AgentSessionMatchingTests(unittest.TestCase):
             self.assertEqual(result[2]["match"], expected_match)
 
 
+class WorkspaceOnlySaveTests(unittest.TestCase):
+    def test_workspace_only_save_filters_windows_groups_and_focus(self):
+        mod = load_module()
+        group = ["0x2", "0x3"]
+        windows = [
+            {"address": "0x1", "class": "firefox", "workspace": {"id": 1, "name": "1"}, "grouped": []},
+            {"address": "0x2", "class": "Alacritty", "workspace": {"id": 3, "name": "3"}, "grouped": group, "groupSize": 2},
+            {"address": "0x3", "class": "Alacritty", "workspace": {"id": 4, "name": "4"}, "grouped": group, "groupSize": 2},
+        ]
+        mod.collect_windows = lambda: windows
+        mod.active_window = lambda: {"address": "0x1", "class": "firefox", "workspace": {"id": 1, "name": "1"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "workspace-3.json"
+            mod.write_session(path, quiet=True, workspaces={"3"})
+            saved = json.loads(path.read_text())
+        self.assertEqual([win["address"] for win in saved["windows"]], ["0x2"])
+        self.assertEqual(saved["windows"][0]["grouped"], [])
+        self.assertEqual(saved["activeWindow"], {})
+
+    def test_cli_saves_named_workspace_profile(self):
+        mod = load_module()
+        calls = []
+        mod.session_path = lambda name=None: Path(f"/tmp/{name}.json")
+        mod.write_session = lambda path, quiet=False, workspaces=None: calls.append((path, workspaces))
+        with mock.patch.object(sys, "argv", ["ws", "save", "focus", "--workspace", "3"]):
+            mod.main()
+        self.assertEqual(calls, [(Path("/tmp/focus.json"), {"3"})])
+
+
 class SessionActionMenuTests(unittest.TestCase):
+    def test_super_space_submenu_saves_one_workspace_as_named_profile(self):
+        mod = load_module()
+        windows = [
+            {"address": "0x1", "workspace": {"id": 1, "name": "1"}},
+            {"address": "0x2", "workspace": {"id": 3, "name": "3"}},
+            {"address": "0x3", "workspace": {"id": 3, "name": "3"}},
+        ]
+        mod.collect_windows = lambda: windows
+        mod.run_menu = lambda labels, prompt: next(label for label in labels if label.startswith("Workspace 3"))
+        mod.run_input = lambda prompt: "coding"
+        mod.session_path = lambda name=None: Path(f"/tmp/{name}.json")
+        calls = []
+        mod.write_session = lambda path, quiet=False, workspaces=None: calls.append((path, workspaces))
+
+        mod.save_workspace_picker()
+
+        self.assertEqual(calls, [(Path("/tmp/coding.json"), {"3"})])
+
     def test_super_space_submenu_routes_to_partial_restore(self):
         mod = load_module()
         selected_path = Path("/tmp/work.json")

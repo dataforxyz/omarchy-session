@@ -8,6 +8,7 @@ workflows.
 Installed commands:
 
 - `ws s [name]` / `omarchy-session save [name]` — save current windows
+- `ws s name --workspace 3` — save only workspace 3 as a named profile
 - `ws r [name]` / `omarchy-session restore [name]` — restore only missing windows
 - `ws rs [name]` / `ws select [name]` — interactively select windows, workspaces, or groups for a partial restore
 - `ws r [name] --workspace 3`, `--item 2,4-7`, or `--group 1` — scriptable partial restore selectors
@@ -59,8 +60,22 @@ The installer does not replace unrelated existing `~/.local/bin/ws`,
 refreshes entries that are missing or already managed by `omarchy-session`; pass
 `--force` to replace unrelated entries. The desktop entry appears as
 **Workspace Sessions** in Omarchy's Super+Space app launcher and opens a submenu
-for save, restore, selective restore, profile/autosave selection, preview,
-autosave, undo, hard undo, status, and dependency checks.
+for full-layout save, saving one selected workspace as a named profile, restore,
+selective restore, profile/autosave selection, preview, autosave, undo, hard
+undo, status, and dependency checks.
+
+## Workspace-only profiles
+
+`ws save name --workspace 3` saves only the windows on workspace 3. Multiple
+workspace values can be comma-separated or repeated. The Super+Space
+**Workspace Sessions** submenu exposes the same flow as **Save one workspace as
+profile…**: select a currently occupied workspace and enter the desired profile
+name. Existing profiles are affected only when that exact name is deliberately
+reused.
+
+Workspace-only saves remove group metadata if a saved group crosses outside the
+selected workspace set. The active window is saved only when it belongs to the
+selection; otherwise restore preserves the user's current focus when possible.
 
 ## Partial restore
 
