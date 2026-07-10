@@ -120,19 +120,24 @@ were independently restored.
 Terminal restore behavior is best effort:
 
 - direct `pi` sessions restore with `pi --session <jsonl>` when matching Pi
-  session files can be found. If multiple Pi windows share the same cwd, the
-  newest unused session for that cwd is assigned to each window to reduce
-  duplicate-session collisions;
-- direct or wrapped Claude sessions restore with `claude --resume <session-id>`
-  when a matching Claude session can be found, otherwise `claude --continue`.
+  session files can be found;
+- direct or wrapped Claude sessions restore with `claude --resume <session-id>`.
   A wrapper can export `OMARCHY_SESSION_CLAUDE_COMMAND` with its executable name
   so restore uses that wrapper instead of bare `claude`;
-- direct or wrapped Codex sessions restore with `codex resume <session-id>` when
-  a matching session can be found, otherwise `codex resume --last`. A wrapper can
-  export `OMARCHY_SESSION_CODEX_COMMAND` with its executable name so restore uses
-  the same wrapper; session lookup also follows `CODEX_HOME` when it is set;
+- direct or wrapped Codex sessions restore with `codex resume <session-id>`.
+  A wrapper can export `OMARCHY_SESSION_CODEX_COMMAND` with its executable name
+  so restore uses the same wrapper; session lookup also follows `CODEX_HOME`;
 - direct or wrapped OpenCode sessions restore with the saved `ses_*` id when the
   local OpenCode version accepts it, otherwise they fall back to plain `opencode`;
+- for all four agents, an explicit session argument in the live process wins.
+  Otherwise candidates are ranked by recorded activity near process start and
+  assigned once per save, preventing same-cwd windows from reusing one session.
+  Codex subagent threads and OpenCode child sessions are excluded. If no unique
+  candidate remains, restore opens the agent picker (or plain OpenCode) rather
+  than silently continuing whichever session happens to be latest. Wrappers can
+  advertise restore commands with `OMARCHY_SESSION_PI_COMMAND`,
+  `OMARCHY_SESSION_CLAUDE_COMMAND`, `OMARCHY_SESSION_CODEX_COMMAND`, or
+  `OMARCHY_SESSION_OPENCODE_COMMAND`;
 - wrapper commands like `make ssh` and remote `make pi N=...` are restored by
   rerunning the original `make` command in the saved working directory;
 - unknown terminal workflows fall back to reopening the saved terminal app in the
