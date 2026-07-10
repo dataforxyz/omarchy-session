@@ -34,7 +34,7 @@ PI_REGISTRY_EXTENSION = Path.home() / ".pi/agent/extensions/omarchy-session-regi
 CLAUDE_REGISTRY_HOOK = Path.home() / ".local/lib/omarchy-session/claude-session-registry.py"
 OPENCODE_REGISTRY_PLUGIN = Path.home() / ".config/opencode/plugins/omarchy-session-registry.ts"
 MAKE_RESTORE_TARGETS = {"ssh", "pi", "claude", "codex", "opencode"}
-DIRECT_RESTORE_COMMANDS = {"ssh", "tmux", "claude", "codex", "opencode"}
+DIRECT_RESTORE_COMMANDS = {"ssh", "tmux", "nvim", "vim", "vi", "claude", "codex", "opencode"}
 EXCLUDED_CLASSES = {"zenity", "pinentry", "org.gnome.polkit", "xdg-desktop-portal"}
 SINGLETON_CLASSES = {
     "chromium", "chromium-browser", "brave-browser", "brave",
@@ -658,7 +658,7 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
             score += 10
         if cwd != home:
             score += 10
-        if exe in {"nvim", "vim", "node", "python", "python3", "bash", "zsh", "fish"}:
+        if exe in {"nvim", "vim", "vi", "node", "python", "python3", "bash", "zsh", "fish"}:
             score += 4
         if " pi" in cmd:
             score += 6

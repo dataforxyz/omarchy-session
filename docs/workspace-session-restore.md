@@ -168,6 +168,11 @@ were independently restored.
 
 Terminal restore behavior is best effort:
 
+- direct `nvim`, `vim`, and `vi` processes preserve their command-line arguments
+  and working directory. This reopens command-line files such as
+  `nvim README.md src/main.py`, but does not independently capture unsaved
+  buffers, cursor positions, splits, tabs, or plugin state; use Neovim session
+  or persistence tooling when that state must survive;
 - direct `pi` sessions restore with `pi --session <jsonl>` when matching Pi
   session files can be found;
 - direct or wrapped Claude sessions restore with `claude --resume <session-id>`.

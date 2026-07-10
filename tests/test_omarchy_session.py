@@ -782,6 +782,42 @@ class AgentSessionMatchingTests(unittest.TestCase):
 
 
 class RestoreCommandTests(unittest.TestCase):
+    def test_terminal_neovim_command_and_working_directory_are_preserved(self):
+        mod = load_module()
+        project = "/tmp/project"
+        mod.read_proc_environ = lambda pid: {}
+        mod.agent_registry_record = lambda tool, pid, env=None: {}
+        mod.read_proc_cwd = lambda pid: project if pid == 102 else "/tmp"
+        mod.read_proc_argv = lambda pid: {
+            101: ["bash"],
+            102: ["nvim", "README.md", "src/main.py"],
+        }.get(pid, [])
+
+        workdir, restore_argv, agent = mod.terminal_child_state(
+            100, "/tmp", {100: [101], 101: [102]}, {}
+        )
+
+        self.assertEqual(workdir, project)
+        self.assertEqual(restore_argv, ["nvim", "README.md", "src/main.py"])
+        self.assertEqual(agent, {})
+
+    def test_neovim_restore_argv_is_launched_inside_the_terminal(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
+                cmd, reason = mod.launch_command({
+                    "class": "Alacritty",
+                    "restoreWorkdir": str(workdir),
+                    "restoreArgv": ["nvim", "README.md"],
+                })
+            self.assertEqual(reason, "")
+            self.assertEqual(cmd, [
+                "alacritty", f"--working-directory={workdir}",
+                "-e", "bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l',
+                "omarchy-session-restore", "nvim", "README.md",
+            ])
+
     def test_codex_launcher_marker_and_custom_session_root(self):
         mod = load_module()
         with mock.patch.object(
