@@ -62,7 +62,7 @@ refreshes entries that are missing or already managed by `omarchy-session`; pass
 `--force` to replace unrelated entries. The desktop entry appears as
 **Workspace Sessions** in Omarchy's Super+Space app launcher and opens a submenu
 for full-layout save, saving one selected workspace as a named profile, restore,
-selective restore, profile/autosave selection, default or picked-save preview, autosave, undo, hard
+selective restore, profile/autosave selection, picked-save preview, autosave, undo, hard
 undo, status, and dependency checks.
 
 ## Workspace-only profiles

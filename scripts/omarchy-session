@@ -3054,12 +3054,14 @@ def partial_restore_picker(path: Path) -> None:
 
 
 def open_command_terminal(*args: str) -> None:
-    command = str(Path(sys.argv[0]).resolve())
+    # Desktop launchers may set argv[0] to only `omarchy-session`, which makes
+    # Path(sys.argv[0]).resolve() point at a nonexistent file under the launcher's
+    # working directory. __file__ always identifies the installed/source script.
+    command = str(Path(__file__).resolve())
     if shutil.which("xdg-terminal-exec"):
-        script = '"$@"; status=$?; printf "\\nPress Enter to close…"; read -r _; exit "$status"'
         subprocess.Popen([
-            "xdg-terminal-exec", "bash", "-lc", script,
-            "omarchy-session-menu", command, *args,
+            "xdg-terminal-exec", "--title=Omarchy Session", "--hold", "--",
+            command, *args,
         ], start_new_session=True)
     else:
         subprocess.Popen([command, *args], start_new_session=True)
@@ -3100,8 +3102,7 @@ def session_action_menu() -> None:
         "󰑓  Restore default",
         "󰩭  Restore selected…",
         "󰍉  Choose profile or autosave…",
-        "󰋼  Preview default plan",
-        "󰍉  Preview profile or autosave…",
+        "󰋼  Preview restore plan…",
         "󰆓  Autosave now",
         "󰕌  Undo last restore",
         "󰕌  Hard undo launched windows",
@@ -3122,9 +3123,7 @@ def session_action_menu() -> None:
         partial_restore_picker(pick_session_path("Select saved session"))
     elif "Choose profile" in picked:
         pick_session("restore")
-    elif "Preview default" in picked:
-        open_command_terminal("plan")
-    elif "Preview profile" in picked:
+    elif "Preview restore plan" in picked:
         path = pick_session_path("Preview saved session")
         open_command_terminal("plan-path", str(path))
     elif "Autosave" in picked:

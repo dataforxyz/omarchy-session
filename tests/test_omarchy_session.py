@@ -833,7 +833,7 @@ class SessionActionMenuTests(unittest.TestCase):
         mod = load_module()
         selected_path = Path("/tmp/autosaves/selected.json")
         mod.run_menu = lambda labels, prompt: next(
-            label for label in labels if "Preview profile or autosave" in label
+            label for label in labels if "Preview restore plan" in label
         )
         mod.pick_session_path = lambda prompt: selected_path
         calls = []
@@ -842,6 +842,22 @@ class SessionActionMenuTests(unittest.TestCase):
         mod.session_action_menu()
 
         self.assertEqual(calls, [("plan-path", str(selected_path))])
+
+    def test_menu_terminal_uses_installed_script_path_not_launcher_argv_zero(self):
+        mod = load_module()
+        calls = []
+        mod.shutil.which = lambda command: "/usr/bin/xdg-terminal-exec" if command == "xdg-terminal-exec" else None
+        mod.subprocess.Popen = lambda argv, **kwargs: calls.append((argv, kwargs))
+        with mock.patch.object(sys, "argv", ["omarchy-session", "menu"]):
+            mod.open_command_terminal("plan-path", "/tmp/session.json")
+
+        argv, kwargs = calls[0]
+        self.assertEqual(argv[:5], [
+            "xdg-terminal-exec", "--title=Omarchy Session", "--hold", "--",
+            str(Path(mod.__file__).resolve()),
+        ])
+        self.assertEqual(argv[-2:], ["plan-path", "/tmp/session.json"])
+        self.assertTrue(kwargs["start_new_session"])
 
     def test_pick_plan_runs_a_dry_run_for_the_selected_file(self):
         mod = load_module()
