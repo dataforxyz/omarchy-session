@@ -19,6 +19,7 @@ an audit report.
 - Best-effort Hyprland group/tab reconstruction
 - Terminal working-directory restoration for Ghostty and Alacritty
 - Neovim/Vim relaunch with the saved working directory and command-line arguments
+- Chromium, Chrome, Brave, Firefox, and Zen profile/mode restoration when explicitly detectable
 - Session resume support for Pi, Claude Code, Codex, and OpenCode
 - Soft undo for the previous layout and hard undo for newly launched windows
 - Post-restore verification with concise failure summaries and a JSON audit
@@ -53,9 +54,12 @@ cd omarchy-session
 scripts/install-omarchy-session.sh
 ```
 
-The installer copies the main script to `~/.local/bin/omarchy-session` and adds
-the `ws` and `restore-workspace` command shortcuts. Existing unrelated files or
-symlinks with those names are left untouched unless `--force` is supplied.
+The installer copies the main script to `~/.local/bin/omarchy-session`, adds
+the `ws` and `restore-workspace` command shortcuts, and installs a **Workspace
+Sessions** launcher entry. On a standard Omarchy setup, open it with
+**Super+Space**; selecting it opens a session-actions submenu. Existing unrelated
+files, symlinks, or desktop entries with those names are left untouched unless
+`--force` is supplied.
 
 For development, link the installed command to the checkout:
 
@@ -88,6 +92,7 @@ ws plan work       # preview a restore without changing anything
 ws r work          # restore only missing windows
 ws rs work         # choose specific windows to restore
 ws pick            # choose a profile or autosave interactively
+ws menu            # open the session-actions submenu
 ws st              # show save, autosave, and restore health
 ```
 
@@ -110,6 +115,7 @@ ws u               Soft undo: restore the pre-restore snapshot
 ws uh              Hard undo: close windows launched by the last restore
 ws st              Show status and health information
 ws deps            Show required and optional dependency status
+ws menu            Open the same submenu exposed in the Super+Space launcher
 ws path [name]     Print a saved session path for scripting
 ws -v l            Show verbose saved-session metadata
 ```
@@ -164,6 +170,32 @@ Restoration is intentionally best effort. Applications such as browsers may
 reuse an existing process, tab, or window rather than create a new Hyprland
 window. Unsupported app classes are skipped and recorded for review rather than
 executed blindly.
+
+## Browser profiles and basic browser state
+
+For regular Chromium, Chrome, Brave, Firefox, and Zen windows, the tool preserves
+profile and private/guest mode arguments when they are explicitly visible in the
+browser process. It can also infer a profile from the process's open files when
+there is exactly one unambiguous candidate—commonly Firefox/Zen, and Chromium
+when that browser process has only one profile loaded. Supported basics include:
+
+- Chromium family: `--profile-directory`, `--user-data-dir`, `--incognito`, and
+  `--guest`;
+- Firefox/Zen family: `-P`, `--profile`/`-profile`, `--no-remote`,
+  `--new-instance`, and private-window mode;
+- Chromium web apps: app URL plus their profile/user-data/class flags, as before.
+
+Explicit profiles become part of the restore key, so a saved Work profile is not
+silently matched to an open Personal profile. The launch reopens the detected
+profile and lets the browser's own startup/session settings decide whether its
+previous tabs return.
+
+The tool does not inspect or guess active URLs, tab lists, or browser history. It
+also refuses to choose among multiple profile candidates exposed by one browser
+process. Multiple plain windows
+from the same browser profile remain a browser-controlled singleton limitation:
+the browser may reuse an existing process/window rather than create every saved
+Hyprland window.
 
 ## Terminal editors
 

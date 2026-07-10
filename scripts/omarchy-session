@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Ben U
 # SPDX-License-Identifier: GPL-3.0-or-later
+import configparser
 import json
 import os
 import re
@@ -36,10 +37,17 @@ OPENCODE_REGISTRY_PLUGIN = Path.home() / ".config/opencode/plugins/omarchy-sessi
 MAKE_RESTORE_TARGETS = {"ssh", "pi", "claude", "codex", "opencode"}
 DIRECT_RESTORE_COMMANDS = {"ssh", "tmux", "nvim", "vim", "vi", "claude", "codex", "opencode"}
 EXCLUDED_CLASSES = {"zenity", "pinentry", "org.gnome.polkit", "xdg-desktop-portal"}
-SINGLETON_CLASSES = {
+CHROMIUM_BROWSER_CLASSES = {
     "chromium", "chromium-browser", "brave-browser", "brave",
-    "google-chrome", "google-chrome-stable", "firefox", "firefoxdeveloperedition",
+    "google-chrome", "google-chrome-stable",
+}
+FIREFOX_BROWSER_CLASSES = {
+    "firefox", "firefoxdeveloperedition",
     "zen", "zen-browser", "zen-twilight", "app.zen_browser.zen",
+}
+BROWSER_CLASSES = CHROMIUM_BROWSER_CLASSES | FIREFOX_BROWSER_CLASSES
+SINGLETON_CLASSES = {
+    *BROWSER_CLASSES,
     "slack", "discord", "signal", "signal-desktop", "obsidian", "thunderbird", "keepassxc",
     "org.keepassxc.keepassxc", "telegram-desktop", "org.telegram.desktop",
 }
@@ -692,6 +700,7 @@ def collect_windows() -> list[dict]:
     proc_children = child_map()
     monitors = monitor_name_by_id()
     used_sessions: dict[str, set[str]] = {}
+    browser_args_by_pid: dict[int, list[str]] = {}
 
     for c in clients:
         cls = c.get("class") or ""
@@ -731,6 +740,10 @@ def collect_windows() -> list[dict]:
             "agentSession": restore_session,
             "piSession": restore_session.get("path", "") if restore_session.get("tool") == "pi" else "",
         })
+        if cls.lower() in BROWSER_CLASSES:
+            if pid not in browser_args_by_pid:
+                browser_args_by_pid[pid] = browser_profile_args_for_process(windows[-1], pid)
+            windows[-1]["browserProfileArgs"] = browser_args_by_pid[pid]
 
     windows.sort(key=lambda w: (w.get("workspace", {}).get("id") or 0, w.get("class") or "", w.get("title") or ""))
     return windows
@@ -793,11 +806,17 @@ def session_summary(windows: list[dict]) -> str:
         1 for w in windows
         if lc_class(w) in TERMINAL_CLASSES and (w.get("restoreArgv") or (w.get("agentSession") or {}).get("id"))
     )
+    browser_profiles = {
+        (lc_class(w), browser_profile_identity(w))
+        for w in windows if browser_profile_identity(w)
+    }
     parts = [plural(len(windows), "window")]
     if workspaces:
         parts.append(f"across {plural(len(workspaces), 'workspace')}")
     if terminal_resumes:
         parts.append(plural(terminal_resumes, "terminal resume"))
+    if browser_profiles:
+        parts.append(plural(len(browser_profiles), "browser profile"))
     if grouped:
         parts.append(plural(len(grouped), "group"))
     return ", ".join(parts)
@@ -810,9 +829,15 @@ def compact_session_summary(windows: list[dict]) -> str:
         1 for w in windows
         if lc_class(w) in TERMINAL_CLASSES and (w.get("restoreArgv") or (w.get("agentSession") or {}).get("id"))
     )
+    browser_profiles = {
+        (lc_class(w), browser_profile_identity(w))
+        for w in windows if browser_profile_identity(w)
+    }
     parts = [f"w{len(windows)}", f"ws{len(workspaces)}", f"g{len(grouped)}"]
     if terminal_resumes:
         parts.append(f"t{terminal_resumes}")
+    if browser_profiles:
+        parts.append(f"b{len(browser_profiles)}")
     return " ".join(parts)
 
 
@@ -1068,12 +1093,180 @@ def normalized_proc_argv(win: dict) -> list[str]:
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg.startswith("--profile-directory=") and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+        profile_value = arg.split("=", 1)[1] if arg.startswith("--profile-directory=") else ""
+        if (
+            profile_value == "Profile"
+            and i + 1 < len(argv)
+            and argv[i + 1].isdigit()
+        ):
             arg = f"{arg} {argv[i + 1]}"
             i += 1
         repaired.append(arg)
         i += 1
     return repaired
+
+
+def browser_profile_args(win: dict) -> list[str]:
+    """Return only browser profile/mode arguments that are safe to replay."""
+    if "browserProfileArgs" in win:
+        saved = win.get("browserProfileArgs") or []
+        return [str(arg) for arg in saved] if isinstance(saved, list) else []
+
+    cls = lc_class(win)
+    if cls not in BROWSER_CLASSES:
+        return []
+    argv = normalized_proc_argv(win)
+    kept: list[str] = []
+    if cls in CHROMIUM_BROWSER_CLASSES:
+        value_words = {"--profile-directory", "--user-data-dir"}
+        value_prefixes = ("--profile-directory=", "--user-data-dir=")
+        switches = {"--incognito", "--guest"}
+    else:
+        value_words = {"-P", "--profile", "-profile"}
+        value_prefixes = ("-P=", "--profile=", "-profile=")
+        switches = {"--no-remote", "--new-instance", "--private", "--private-window"}
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith(value_prefixes):
+            kept.append(arg)
+        elif arg in value_words and i + 1 < len(argv):
+            kept.extend([arg, argv[i + 1]])
+            i += 1
+        elif arg in switches:
+            kept.append(arg)
+        i += 1
+    return kept
+
+
+def browser_profile_selector_present(cls: str, args: list[str]) -> bool:
+    if cls in CHROMIUM_BROWSER_CLASSES:
+        return any(arg == "--profile-directory" or arg.startswith("--profile-directory=") for arg in args)
+    return any(
+        arg in {"-P", "--profile", "-profile"}
+        or arg.startswith(("-P=", "--profile=", "-profile="))
+        for arg in args
+    )
+
+
+def inferred_browser_profile_args(win: dict, fd_targets: list[str]) -> list[str]:
+    cls = lc_class(win)
+    if cls in FIREFOX_BROWSER_CLASSES:
+        profiles = {
+            str(Path(target).parent)
+            for target in fd_targets
+            if Path(target).name == ".parentlock"
+        }
+        if len(profiles) == 1:
+            return ["--profile", profiles.pop()]
+        return []
+
+    if cls not in CHROMIUM_BROWSER_CLASSES:
+        return []
+    args = browser_profile_args(win)
+    user_data = ""
+    for index, arg in enumerate(args):
+        if arg.startswith("--user-data-dir="):
+            user_data = arg.split("=", 1)[1]
+        elif arg == "--user-data-dir" and index + 1 < len(args):
+            user_data = args[index + 1]
+    if user_data:
+        root = Path(user_data).expanduser()
+    elif cls in {"brave", "brave-browser"}:
+        root = Path.home() / ".config/BraveSoftware/Brave-Browser"
+    elif cls in {"google-chrome", "google-chrome-stable"}:
+        root = Path.home() / ".config/google-chrome"
+    else:
+        root = Path.home() / ".config/chromium"
+
+    profiles: set[str] = set()
+    for target in fd_targets:
+        try:
+            relative = Path(target).relative_to(root)
+        except ValueError:
+            continue
+        if not relative.parts:
+            continue
+        candidate = relative.parts[0]
+        if candidate in {"Default", "Profile", "Guest Profile"} or candidate.startswith("Profile "):
+            profiles.add(candidate)
+    if len(profiles) == 1:
+        return [f"--profile-directory={profiles.pop()}"]
+    return []
+
+
+def firefox_profile_name(cls: str, profile_path: str) -> str:
+    zen_classes = {"zen", "zen-browser", "zen-twilight", "app.zen_browser.zen"}
+    profiles_ini = Path.home() / (
+        ".zen/profiles.ini" if cls in zen_classes else ".mozilla/firefox/profiles.ini"
+    )
+    if not profiles_ini.is_file():
+        return ""
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(profiles_ini)
+        wanted = Path(profile_path).resolve()
+        for section in parser.sections():
+            if not section.startswith("Profile"):
+                continue
+            configured = parser.get(section, "Path", fallback="")
+            if not configured:
+                continue
+            candidate = Path(configured)
+            if parser.getboolean(section, "IsRelative", fallback=True):
+                candidate = profiles_ini.parent / candidate
+            if candidate.expanduser().resolve() == wanted:
+                return parser.get(section, "Name", fallback="")
+    except Exception:
+        return ""
+    return ""
+
+
+def browser_profile_args_for_process(win: dict, pid: int) -> list[str]:
+    args = browser_profile_args(win)
+    cls = lc_class(win)
+    if browser_profile_selector_present(cls, args) or pid <= 0:
+        return args
+    targets: list[str] = []
+    try:
+        for fd in Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                targets.append(str(fd.resolve()))
+            except Exception:
+                continue
+    except Exception:
+        return args
+    inferred = inferred_browser_profile_args(win, targets)
+    if cls in FIREFOX_BROWSER_CLASSES and len(inferred) == 2 and inferred[0] == "--profile":
+        profile_name = firefox_profile_name(cls, inferred[1])
+        if profile_name:
+            inferred = ["-P", profile_name]
+    return [*inferred, *args]
+
+
+def browser_profile_identity(win: dict) -> str:
+    args = browser_profile_args(win)
+    return shlex.join(args) if args else ""
+
+
+def browser_profile_summary(win: dict) -> str:
+    args = browser_profile_args(win)
+    if not args:
+        return ""
+    for index, arg in enumerate(args):
+        if arg.startswith("--profile-directory="):
+            return arg.split("=", 1)[1]
+        if arg in {"--profile-directory", "-P"} and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(("--profile=", "-profile=", "-P=")):
+            return human_path(arg.split("=", 1)[1])
+        if arg in {"--profile", "-profile", "--user-data-dir"} and index + 1 < len(args):
+            return human_path(args[index + 1])
+        if arg.startswith("--user-data-dir="):
+            return human_path(arg.split("=", 1)[1])
+    modes = [arg.removeprefix("--") for arg in args if arg.startswith("--")]
+    return ", ".join(modes)
 
 
 def chrome_app_url_from_class(cls: str) -> str:
@@ -1197,7 +1390,8 @@ def restore_key(win: dict) -> str:
     if webapp_url:
         return f"ws:{ws}|webapp:{webapp_url}|flags:{' '.join(webapp_flags)}"
     if cls in SINGLETON_CLASSES:
-        return f"app:{cls}"
+        profile = browser_profile_identity(win) if cls in BROWSER_CLASSES else ""
+        return f"app:{cls}|browser:{profile}" if profile else f"app:{cls}"
     workdir = win.get("restoreWorkdir") or ""
     if cls in TERMINAL_CLASSES:
         agent = win.get("agentSession") or {}
@@ -1287,6 +1481,11 @@ def compatible_current_window(target: dict, candidate: dict) -> bool:
         return True
     if lc_class(candidate) != lc_class(target):
         return False
+    if lc_class(target) in BROWSER_CLASSES:
+        target_profile = browser_profile_identity(target)
+        candidate_profile = browser_profile_identity(candidate)
+        if (target_profile or candidate_profile) and target_profile != candidate_profile:
+            return False
 
     target_title = target.get("title") or ""
     candidate_title = candidate.get("title") or ""
@@ -1311,6 +1510,11 @@ def candidate_match_score(target: dict, candidate: dict) -> int:
         return 100
     if lc_class(candidate) != lc_class(target):
         return 0
+    if lc_class(target) in BROWSER_CLASSES:
+        target_profile = browser_profile_identity(target)
+        candidate_profile = browser_profile_identity(candidate)
+        if (target_profile or candidate_profile) and target_profile != candidate_profile:
+            return 0
 
     target_title = target.get("title") or ""
     candidate_title = candidate.get("title") or ""
@@ -1892,15 +2096,15 @@ def launch_command(win: dict) -> tuple[list[str] | None, str]:
         if restore_argv:
             cmd.extend(["-e", *terminal_exec_argv(restore_argv)])
     elif cls in {"chromium", "chromium-browser"}:
-        cmd = ["chromium"]
+        cmd = ["chromium", *browser_profile_args(win)]
     elif cls in {"brave-browser", "brave"}:
-        cmd = ["brave"]
+        cmd = ["brave", *browser_profile_args(win)]
     elif cls in {"google-chrome", "google-chrome-stable"}:
-        cmd = ["google-chrome-stable"]
+        cmd = ["google-chrome-stable", *browser_profile_args(win)]
     elif cls in {"firefox", "firefoxdeveloperedition"}:
-        cmd = ["firefox"]
+        cmd = ["firefox", *browser_profile_args(win)]
     elif cls in {"zen", "zen-browser", "zen-twilight", "app.zen_browser.zen"}:
-        cmd = [first_available_command(["zen-browser", "zen", "zen-twilight"])]
+        cmd = [first_available_command(["zen-browser", "zen", "zen-twilight"]), *browser_profile_args(win)]
     elif cls == "obsidian":
         cmd = ["obsidian"]
     elif cls == "slack":
@@ -1991,6 +2195,8 @@ def audit_window_record(win: dict) -> dict:
         record["restoreArgv"] = win.get("restoreArgv")
     if win.get("agentSession"):
         record["agentSession"] = win.get("agentSession")
+    if browser_profile_args(win):
+        record["browserProfileArgs"] = browser_profile_args(win)
     return record
 
 
@@ -2806,6 +3012,60 @@ def partial_restore_picker(path: Path) -> None:
             return
 
 
+def open_command_terminal(*args: str) -> None:
+    command = str(Path(sys.argv[0]).resolve())
+    if shutil.which("xdg-terminal-exec"):
+        script = '"$@"; status=$?; printf "\\nPress Enter to close…"; read -r _; exit "$status"'
+        subprocess.Popen([
+            "xdg-terminal-exec", "bash", "-lc", script,
+            "omarchy-session-menu", command, *args,
+        ], start_new_session=True)
+    else:
+        subprocess.Popen([command, *args], start_new_session=True)
+
+
+def session_action_menu() -> None:
+    options = [
+        "󰆓  Save current layout",
+        "󰑓  Restore default",
+        "󰩭  Restore selected…",
+        "󰍉  Choose profile or autosave…",
+        "󰋼  Preview default plan",
+        "󰆓  Autosave now",
+        "󰕌  Undo last restore",
+        "󰕌  Hard undo launched windows",
+        "󰋽  Status",
+        "󰒋  Dependency check",
+        "Cancel",
+    ]
+    picked = run_menu(options, "Workspace sessions")
+    if not picked or picked == "Cancel":
+        return
+    if "Save current" in picked:
+        write_session(SESSION_FILE)
+    elif "Restore default" in picked:
+        restore(SESSION_FILE, save_undo=True)
+    elif "Restore selected" in picked:
+        partial_restore_picker(pick_session_path("Select saved session"))
+    elif "Choose profile" in picked:
+        pick_session("restore")
+    elif "Preview" in picked:
+        open_command_terminal("plan")
+    elif "Autosave" in picked:
+        path = autosave_once(quiet=True)
+        notify("Omarchy session autosave", session_file_summary(path))
+    elif "Hard undo" in picked:
+        confirm = run_menu(["Close windows launched by the last restore", "Cancel"], "Confirm hard undo")
+        if confirm.startswith("Close windows"):
+            hard_undo()
+    elif "Undo last" in picked:
+        restore(UNDO_FILE, save_undo=False)
+    elif "Status" in picked:
+        open_command_terminal("status")
+    elif "Dependency" in picked:
+        open_command_terminal("deps")
+
+
 def count_session_windows(path: Path) -> str:
     if not path.exists() and not path.is_symlink():
         return "missing"
@@ -2925,10 +3185,12 @@ def health_status() -> None:
             print(f"  restore audit: unreadable ({LAST_RESTORE_AUDIT_FILE})")
     else:
         print("  restore audit: missing")
+    launcher = Path.home() / ".local/share/applications/omarchy-session.desktop"
+    print(f"  Super+Space launcher: {'installed' if launcher.exists() else 'missing'}")
     print(f"  unknown classes: {unknown_classes_summary()}")
     print("  shortcuts:")
     print(shortcuts_help_block())
-    print("  commands: ws s, ws r, ws plan, ws pick, ws a, ws as, ws u, ws undo-hard, ws status, ws deps, ws unknowns")
+    print("  commands: ws s, ws r, ws rs, ws plan, ws pick, ws menu, ws a, ws as, ws u, ws undo-hard, ws status, ws deps, ws unknowns")
 
 
 def list_session(path: Path = SESSION_FILE) -> None:
@@ -2970,6 +3232,9 @@ def list_session(path: Path = SESSION_FILE) -> None:
             suffix += f" [monitor: {w.get('monitorName')}]"
         if webapp_url:
             suffix += f" [webapp: {webapp_url}]"
+        profile_summary = browser_profile_summary(w)
+        if profile_summary and not webapp_url:
+            suffix += f" [browser profile: {profile_summary}]"
         prefix = f"item {item_index}: " if ws != "0" else ""
         print(f"{prefix}workspace {ws}: {w.get('class')} — {w.get('title')}{suffix}")
 
@@ -2998,10 +3263,11 @@ Short commands:
   uh          hard undo: close windows launched by the last restore
   st          status/health
   deps        dependency check
+  menu        workspace-session action menu (also available from Super+Space)
   unknowns    list app classes skipped as unknown during restore
 
 Full commands still work:
-  save [name], restore [selectors] [--dry-run|--plan] [name], select [name], plan [selectors] [name], dry-run [name], list [name], profiles, pick [restore|select|list|path], autosave, autosaves, undo, undo-hard, status, deps, unknowns, path [name]
+  save [name], restore [selectors] [--dry-run|--plan] [name], select [name], plan [selectors] [name], dry-run [name], list [name], profiles, pick [restore|select|list|path], autosave, autosaves, undo, undo-hard, status, deps, menu, unknowns, path [name]
 
 Current shortcuts:
 {shortcuts_help_block()}
@@ -3120,6 +3386,8 @@ def main() -> None:
         hard_undo()
     elif cmd == "status":
         health_status()
+    elif cmd == "menu":
+        session_action_menu()
     elif cmd in {"deps", "doctor", "check"}:
         dependency_status()
     elif cmd in {"unknowns", "unknown-classes"}:

@@ -7,6 +7,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$SCRIPT_DIR/omarchy-session"
 BIN_DIR="${HOME}/.local/bin"
+APPLICATIONS_DIR="${HOME}/.local/share/applications"
+DESKTOP_FILE="$APPLICATIONS_DIR/omarchy-session.desktop"
 MODE="copy"
 FORCE=0
 UNINSTALL=0
@@ -15,7 +17,8 @@ usage() {
     cat <<'USAGE'
 Usage: scripts/install-omarchy-session.sh [--copy|--link] [--force|--uninstall]
 
-Installs scripts/omarchy-session to ~/.local/bin/omarchy-session and refreshes
+Installs scripts/omarchy-session to ~/.local/bin/omarchy-session, adds a
+"Workspace Sessions" entry to the Super+Space app launcher, and refreshes
 short aliases:
   ws -> omarchy-session
   restore-workspace -> omarchy-session
@@ -68,6 +71,32 @@ binary_is_managed() {
     [[ -f "$dest" ]] && grep -Fq 'SESSION_FILE = STATE_DIR / "last-session.json"' "$dest"
 }
 
+desktop_is_managed() {
+    [[ -f "$1" ]] && grep -Fq 'X-Omarchy-Session-Managed=true' "$1"
+}
+
+install_desktop_launcher() {
+    if [[ -e "$DESKTOP_FILE" ]] && [[ "$FORCE" -ne 1 ]] && ! desktop_is_managed "$DESKTOP_FILE"; then
+        echo "Warning: refusing to replace unrelated existing $DESKTOP_FILE" >&2
+        echo "         Re-run with --force to replace it." >&2
+        return
+    fi
+    mkdir -p "$APPLICATIONS_DIR"
+    cat > "$DESKTOP_FILE" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Workspace Sessions
+Comment=Save, restore, preview, and undo Hyprland workspace sessions
+Exec=omarchy-session menu
+Icon=preferences-desktop-workspace
+Terminal=false
+Categories=Utility;
+Keywords=workspace;session;save;restore;hyprland;
+X-Omarchy-Session-Managed=true
+DESKTOP
+    echo "Installed Super+Space launcher entry: $DESKTOP_FILE"
+}
+
 install_alias() {
     local name="$1"
     local dest="$BIN_DIR/$name"
@@ -94,6 +123,10 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
             echo "Removed managed shortcut: $dest"
         fi
     done
+    if desktop_is_managed "$DESKTOP_FILE"; then
+        rm -f "$DESKTOP_FILE"
+        echo "Removed managed launcher entry: $DESKTOP_FILE"
+    fi
     if [[ -e "$BIN_DIR/omarchy-session" || -L "$BIN_DIR/omarchy-session" ]]; then
         if binary_is_managed "$BIN_DIR/omarchy-session"; then
             rm -f "$BIN_DIR/omarchy-session"
@@ -114,6 +147,10 @@ else
 fi
 install_alias ws
 install_alias restore-workspace
+install_desktop_launcher
 chmod +x "$BIN_DIR/omarchy-session" 2>/dev/null || true
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$APPLICATIONS_DIR" >/dev/null 2>&1 || true
+fi
 
 echo "Installed omarchy-session ($MODE) to $BIN_DIR"

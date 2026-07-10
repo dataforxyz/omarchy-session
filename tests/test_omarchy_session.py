@@ -781,6 +781,135 @@ class AgentSessionMatchingTests(unittest.TestCase):
             self.assertEqual(result[2]["match"], expected_match)
 
 
+class SessionActionMenuTests(unittest.TestCase):
+    def test_super_space_submenu_routes_to_partial_restore(self):
+        mod = load_module()
+        selected_path = Path("/tmp/work.json")
+        prompts = []
+        mod.run_menu = lambda labels, prompt: prompts.append((labels, prompt)) or next(
+            label for label in labels if "Restore selected" in label
+        )
+        mod.pick_session_path = lambda prompt: selected_path
+        calls = []
+        mod.partial_restore_picker = lambda path: calls.append(path)
+
+        mod.session_action_menu()
+
+        self.assertEqual(calls, [selected_path])
+        self.assertEqual(prompts[0][1], "Workspace sessions")
+        self.assertTrue(any("Save current layout" in label for label in prompts[0][0]))
+        self.assertTrue(any("Choose profile or autosave" in label for label in prompts[0][0]))
+
+
+class BrowserProfileRestoreTests(unittest.TestCase):
+    def test_chromium_profile_and_mode_args_are_preserved_without_urls(self):
+        mod = load_module()
+        win = {
+            "class": "chromium",
+            "procArgv": [
+                "/usr/bin/chromium", "--profile-directory=Profile 2",
+                "--user-data-dir=/tmp/chromium-data", "--incognito",
+                "https://example.com/private",
+            ],
+        }
+        self.assertEqual(mod.browser_profile_args(win), [
+            "--profile-directory=Profile 2",
+            "--user-data-dir=/tmp/chromium-data",
+            "--incognito",
+        ])
+        self.assertEqual(mod.browser_profile_summary(win), "Profile 2")
+        with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
+            cmd, reason = mod.launch_command(win)
+        self.assertEqual(reason, "")
+        self.assertEqual(cmd, [
+            "chromium", "--profile-directory=Profile 2",
+            "--user-data-dir=/tmp/chromium-data", "--incognito",
+        ])
+
+    def test_firefox_and_zen_profile_args_are_preserved(self):
+        mod = load_module()
+        firefox = {
+            "class": "firefox",
+            "procArgv": ["firefox", "-P", "Work", "--no-remote", "--new-window", "https://example.com"],
+        }
+        zen = {
+            "class": "zen-browser",
+            "procArgv": ["zen-browser", "--profile", "/tmp/zen-profile", "--private-window"],
+        }
+        self.assertEqual(mod.browser_profile_args(firefox), ["-P", "Work", "--no-remote"])
+        self.assertEqual(
+            mod.browser_profile_args(zen),
+            ["--profile", "/tmp/zen-profile", "--private-window"],
+        )
+        with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
+            firefox_cmd, _ = mod.launch_command(firefox)
+            zen_cmd, _ = mod.launch_command(zen)
+        self.assertEqual(firefox_cmd, ["firefox", "-P", "Work", "--no-remote"])
+        self.assertEqual(
+            zen_cmd,
+            ["zen-browser", "--profile", "/tmp/zen-profile", "--private-window"],
+        )
+
+    def test_explicit_browser_profiles_have_distinct_restore_keys_and_matching(self):
+        mod = load_module()
+        work = {"address": "0x1", "class": "chromium", "browserProfileArgs": ["--profile-directory=Work"]}
+        personal = {"address": "0x2", "class": "chromium", "browserProfileArgs": ["--profile-directory=Personal"]}
+        same_work = {"address": "0xc1", "class": "chromium", "browserProfileArgs": ["--profile-directory=Work"]}
+
+        self.assertNotEqual(mod.restore_key(work), mod.restore_key(personal))
+        self.assertTrue(mod.compatible_current_window(work, same_work))
+        self.assertFalse(mod.compatible_current_window(work, personal))
+        self.assertEqual(mod.duplicate_singleton_addresses([work, personal]), set())
+
+    def test_profile_can_be_inferred_from_unambiguous_browser_open_files(self):
+        mod = load_module()
+        firefox_profile = "/home/demo/.mozilla/firefox/abc.default-release"
+        self.assertEqual(
+            mod.inferred_browser_profile_args(
+                {"class": "firefox"},
+                [f"{firefox_profile}/.parentlock", f"{firefox_profile}/places.sqlite"],
+            ),
+            ["--profile", firefox_profile],
+        )
+
+        chromium_root = Path.home() / ".config/chromium"
+        self.assertEqual(
+            mod.inferred_browser_profile_args(
+                {"class": "chromium"},
+                [str(chromium_root / "Profile 2/History"), str(chromium_root / "Profile 2/Favicons")],
+            ),
+            ["--profile-directory=Profile 2"],
+        )
+        self.assertEqual(
+            mod.inferred_browser_profile_args(
+                {"class": "chromium"},
+                [str(chromium_root / "Profile 2/History"), str(chromium_root / "Profile/History")],
+            ),
+            [],
+        )
+
+    def test_firefox_inferred_profile_path_maps_to_portable_profile_name(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            profile = home / ".mozilla/firefox/abc.default-release"
+            profile.mkdir(parents=True)
+            (home / ".mozilla/firefox/profiles.ini").write_text(
+                "[Profile0]\nName=work\nIsRelative=1\nPath=abc.default-release\n"
+            )
+            with mock.patch.object(mod.Path, "home", return_value=home):
+                self.assertEqual(mod.firefox_profile_name("firefox", str(profile)), "work")
+
+    def test_saved_empty_profile_args_do_not_replay_unfiltered_legacy_argv(self):
+        mod = load_module()
+        win = {
+            "class": "firefox",
+            "browserProfileArgs": [],
+            "procArgv": ["firefox", "-P", "Other"],
+        }
+        self.assertEqual(mod.browser_profile_args(win), [])
+
+
 class RestoreCommandTests(unittest.TestCase):
     def test_terminal_neovim_command_and_working_directory_are_preserved(self):
         mod = load_module()
@@ -998,6 +1127,8 @@ class InstallerSafetyTests(unittest.TestCase):
             env = os.environ.copy()
             env["HOME"] = str(home)
             subprocess.run(["bash", str(INSTALLER), "--copy"], env=env, check=True, capture_output=True, text=True)
+            desktop_file = home / ".local/share/applications/omarchy-session.desktop"
+            self.assertIn("Exec=omarchy-session menu", desktop_file.read_text())
             unrelated = bin_dir / "restore-workspace"
             unrelated.unlink()
             unrelated.symlink_to("other-tool")
@@ -1005,6 +1136,7 @@ class InstallerSafetyTests(unittest.TestCase):
             subprocess.run(["bash", str(INSTALLER), "--uninstall"], env=env, check=True, capture_output=True, text=True)
 
             self.assertFalse((bin_dir / "omarchy-session").exists())
+            self.assertFalse(desktop_file.exists())
             self.assertFalse((bin_dir / "ws").exists())
             self.assertTrue(unrelated.is_symlink())
             self.assertEqual(os.readlink(unrelated), "other-tool")
@@ -1025,6 +1157,22 @@ class InstallerSafetyTests(unittest.TestCase):
             )
             self.assertIn("refusing to remove unrelated", result.stderr)
             self.assertTrue(command.exists())
+
+    def test_installer_preserves_unrelated_super_space_launcher_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            desktop_file = home / ".local/share/applications/omarchy-session.desktop"
+            desktop_file.parent.mkdir(parents=True)
+            desktop_file.write_text("[Desktop Entry]\nName=Unrelated\n")
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+
+            result = subprocess.run(
+                ["bash", str(INSTALLER), "--copy"], env=env,
+                check=True, capture_output=True, text=True,
+            )
+            self.assertIn("refusing to replace unrelated", result.stderr)
+            self.assertEqual(desktop_file.read_text(), "[Desktop Entry]\nName=Unrelated\n")
 
     def test_installer_refreshes_existing_managed_alias(self):
         with tempfile.TemporaryDirectory() as tmp:

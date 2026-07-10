@@ -20,6 +20,7 @@ Installed commands:
 - `ws uh` / `ws undo-hard` — hard undo: close windows launched by the previous restore only
 - `ws st` / `ws status` — show autosave health, save ages/counts, install path, shortcuts, and last-restore info
 - `ws deps` / `ws doctor` / `ws check` — show required and optional dependency status
+- `ws menu` — open the workspace-session action submenu installed as the **Workspace Sessions** Super+Space launcher entry
 
 Default output is summary-first: saves/autosaves report window/workspace counts, terminal resumes, groups, and relative ages like `12m ago` instead of full state-file paths or raw timestamps. Use `-v` / `--verbose` (for example, `ws -v l`) when you need saved paths, raw timestamps, and restore metadata; `ws path [name]` still prints just the path for scripting.
 
@@ -52,10 +53,14 @@ scripts/install-agent-integrations.py --uninstall
 scripts/install-omarchy-session.sh --uninstall
 ```
 
-The installer does not replace unrelated existing `~/.local/bin/ws` or
-`~/.local/bin/restore-workspace` entries by default. It refreshes aliases that
-are missing or already point to `omarchy-session`; pass `--force` to replace
-unrelated aliases and keep the historical clobbering behavior.
+The installer does not replace unrelated existing `~/.local/bin/ws`,
+`~/.local/bin/restore-workspace`, or
+`~/.local/share/applications/omarchy-session.desktop` entries by default. It
+refreshes entries that are missing or already managed by `omarchy-session`; pass
+`--force` to replace unrelated entries. The desktop entry appears as
+**Workspace Sessions** in Omarchy's Super+Space app launcher and opens a submenu
+for save, restore, selective restore, profile/autosave selection, preview,
+autosave, undo, hard undo, status, and dependency checks.
 
 ## Partial restore
 
@@ -118,7 +123,7 @@ Runtime state lives in `~/.local/state/omarchy-session/` and includes:
 Review those files before sharing them. They can contain window titles, window
 classes, workspace and monitor names, host name, timestamps, process IDs,
 `procCmdline`, `procArgv`, `procCwd`, `restoreWorkdir`, `restoreArgv`,
-`agentSession`, `piSession`, and restore command hints. The tool reads local
+`browserProfileArgs`, `agentSession`, `piSession`, and restore command hints. The tool reads local
 Hyprland window metadata, `/proc` process command lines/working directories, and
 local Pi/Claude/Codex/OpenCode session metadata to make restore more useful; it
 does not intentionally collect secrets, but commands, paths, titles, and agent
@@ -158,13 +163,26 @@ new windows, workspace/monitor mismatches where detectable, group verification
 details, and focus outcome. Normal restore output only notes that the audit was
 saved; use `-v` to show the audit path.
 
-Plain singleton app targets such as normal Firefox or Chromium windows are a
-known limitation: launching those apps can reuse an existing process, window, or
-tab, so multiple saved plain-browser windows with the same singleton restore key
-cannot be restored as independent Hyprland windows reliably. Duplicate singleton
-targets are now marked as `duplicate_singleton_unsupported` in the audit and are
-included in the `restore needs review` summary instead of being counted as if they
-were independently restored.
+Regular Chromium, Chrome, Brave, Firefox, and Zen targets preserve explicit
+profile/mode arguments when those arguments are visible in the browser process.
+When no profile selector is present, restore can infer one from open profile files
+only if there is exactly one candidate (usually Firefox/Zen, or a Chromium process
+with only one loaded profile). The Chromium family keeps `--profile-directory`,
+`--user-data-dir`, `--incognito`, and `--guest`; Firefox/Zen keep `-P`,
+`--profile`/`-profile`, `--no-remote`,
+`--new-instance`, and private-window mode. Explicit profile arguments become part
+of the restore key, preventing a Work profile from being matched to an open
+Personal profile. Chromium web-app URL/profile restoration continues to use its
+existing app-window handling.
+
+Browser restoration deliberately does not inspect or guess tab URLs or history,
+and it refuses to choose among multiple profile candidates. The selected browser profile's own startup/session
+settings may restore previous tabs. Multiple plain windows from the same browser
+profile remain a known singleton limitation: launching can reuse an existing
+process, window, or tab, so they cannot be recreated as independent Hyprland
+windows reliably. Duplicate singleton targets are marked as
+`duplicate_singleton_unsupported` in the audit and included in the
+`restore needs review` summary.
 
 Terminal restore behavior is best effort:
 
