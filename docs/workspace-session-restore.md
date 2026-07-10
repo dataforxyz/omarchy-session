@@ -124,9 +124,13 @@ Terminal restore behavior is best effort:
   newest unused session for that cwd is assigned to each window to reduce
   duplicate-session collisions;
 - direct or wrapped Claude sessions restore with `claude --resume <session-id>`
-  when a matching Claude session can be found, otherwise `claude --continue`;
+  when a matching Claude session can be found, otherwise `claude --continue`.
+  A wrapper can export `OMARCHY_SESSION_CLAUDE_COMMAND` with its executable name
+  so restore uses that wrapper instead of bare `claude`;
 - direct or wrapped Codex sessions restore with `codex resume <session-id>` when
-  a matching Codex session can be found, otherwise `codex resume --last`;
+  a matching session can be found, otherwise `codex resume --last`. A wrapper can
+  export `OMARCHY_SESSION_CODEX_COMMAND` with its executable name so restore uses
+  the same wrapper; session lookup also follows `CODEX_HOME` when it is set;
 - direct or wrapped OpenCode sessions restore with the saved `ses_*` id when the
   local OpenCode version accepts it, otherwise they fall back to plain `opencode`;
 - wrapper commands like `make ssh` and remote `make pi N=...` are restored by
