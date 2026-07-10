@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Saved workspace grid">
+  <defs>
+    <mask id="windows">
+      <rect width="512" height="512" rx="112" fill="white"/>
+      <rect x="116" y="116" width="116" height="104" rx="20" fill="black"/>
+      <rect x="248" y="116" width="148" height="104" rx="20" fill="black"/>
+      <rect x="116" y="236" width="176" height="160" rx="20" fill="black"/>
+      <rect x="308" y="236" width="88" height="160" rx="20" fill="black"/>
+    </mask>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#000" mask="url(#windows)"/>
+  <path d="M320 276c0-11 9-20 20-20h40c11 0 20 9 20 20v132l-40-26-40 26V276z" fill="#000"/>
+</svg>

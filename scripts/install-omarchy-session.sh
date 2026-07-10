@@ -9,6 +9,10 @@ SRC="$SCRIPT_DIR/omarchy-session"
 BIN_DIR="${HOME}/.local/bin"
 APPLICATIONS_DIR="${HOME}/.local/share/applications"
 DESKTOP_FILE="$APPLICATIONS_DIR/omarchy-session.desktop"
+ASSETS_DIR="$(cd "$SCRIPT_DIR/../assets" && pwd)"
+ICONS_DIR="${HOME}/.local/share/icons/hicolor"
+SCALABLE_ICON="$ICONS_DIR/scalable/apps/omarchy-session.svg"
+SYMBOLIC_ICON="$ICONS_DIR/symbolic/apps/omarchy-session-symbolic.svg"
 MODE="copy"
 FORCE=0
 UNINSTALL=0
@@ -18,7 +22,7 @@ usage() {
 Usage: scripts/install-omarchy-session.sh [--copy|--link] [--force|--uninstall]
 
 Installs scripts/omarchy-session to ~/.local/bin/omarchy-session, adds a
-"Workspace Sessions" entry to the Super+Space app launcher, and refreshes
+"Workspace Sessions" entry and icon to the Super+Space app launcher, and refreshes
 short aliases:
   ws -> omarchy-session
   restore-workspace -> omarchy-session
@@ -71,6 +75,27 @@ binary_is_managed() {
     [[ -f "$dest" ]] && grep -Fq 'SESSION_FILE = STATE_DIR / "last-session.json"' "$dest"
 }
 
+icon_is_managed() {
+    [[ -f "$SCALABLE_ICON" ]] && grep -Fq 'omarchy-session Saved Grid icon' "$SCALABLE_ICON"
+}
+
+install_icons() {
+    if [[ -e "$SCALABLE_ICON" ]] && [[ "$FORCE" -ne 1 ]] && ! icon_is_managed; then
+        echo "Warning: refusing to replace unrelated existing $SCALABLE_ICON" >&2
+        echo "         Re-run with --force to replace it." >&2
+        return
+    fi
+    mkdir -p "$(dirname "$SCALABLE_ICON")" "$(dirname "$SYMBOLIC_ICON")"
+    install -m 0644 "$ASSETS_DIR/omarchy-session.svg" "$SCALABLE_ICON"
+    install -m 0644 "$ASSETS_DIR/omarchy-session-symbolic.svg" "$SYMBOLIC_ICON"
+    for size in 16 24 32 48 64 128 256 512; do
+        destination="$ICONS_DIR/${size}x${size}/apps"
+        mkdir -p "$destination"
+        install -m 0644 "$ASSETS_DIR/icons/png/omarchy-session-${size}.png" "$destination/omarchy-session.png"
+    done
+    echo "Installed Saved Grid icon set under $ICONS_DIR"
+}
+
 desktop_is_managed() {
     [[ -f "$1" ]] && grep -Fq 'X-Omarchy-Session-Managed=true' "$1"
 }
@@ -88,7 +113,7 @@ Type=Application
 Name=Workspace Sessions
 Comment=Save, restore, preview, and undo Hyprland workspace sessions
 Exec=omarchy-session menu
-Icon=preferences-desktop-workspace
+Icon=omarchy-session
 Terminal=false
 Categories=Utility;
 Keywords=workspace;session;save;restore;hyprland;
@@ -123,6 +148,13 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
             echo "Removed managed shortcut: $dest"
         fi
     done
+    if icon_is_managed; then
+        rm -f "$SCALABLE_ICON" "$SYMBOLIC_ICON"
+        for size in 16 24 32 48 64 128 256 512; do
+            rm -f "$ICONS_DIR/${size}x${size}/apps/omarchy-session.png"
+        done
+        echo "Removed managed Saved Grid icon set"
+    fi
     if desktop_is_managed "$DESKTOP_FILE"; then
         rm -f "$DESKTOP_FILE"
         echo "Removed managed launcher entry: $DESKTOP_FILE"
@@ -147,10 +179,14 @@ else
 fi
 install_alias ws
 install_alias restore-workspace
+install_icons
 install_desktop_launcher
 chmod +x "$BIN_DIR/omarchy-session" 2>/dev/null || true
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$APPLICATIONS_DIR" >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "$ICONS_DIR" >/dev/null 2>&1 || true
 fi
 
 echo "Installed omarchy-session ($MODE) to $BIN_DIR"
