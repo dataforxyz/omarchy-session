@@ -1175,7 +1175,12 @@ class InstallerSafetyTests(unittest.TestCase):
             env["HOME"] = str(home)
             subprocess.run(["bash", str(INSTALLER), "--copy"], env=env, check=True, capture_output=True, text=True)
             desktop_file = home / ".local/share/applications/omarchy-session.desktop"
+            scalable_icon = home / ".local/share/icons/hicolor/scalable/apps/omarchy-session.svg"
+            png_icon = home / ".local/share/icons/hicolor/64x64/apps/omarchy-session.png"
             self.assertIn("Exec=omarchy-session menu", desktop_file.read_text())
+            self.assertIn("Icon=omarchy-session", desktop_file.read_text())
+            self.assertTrue(scalable_icon.exists())
+            self.assertTrue(png_icon.exists())
             unrelated = bin_dir / "restore-workspace"
             unrelated.unlink()
             unrelated.symlink_to("other-tool")
@@ -1184,6 +1189,8 @@ class InstallerSafetyTests(unittest.TestCase):
 
             self.assertFalse((bin_dir / "omarchy-session").exists())
             self.assertFalse(desktop_file.exists())
+            self.assertFalse(scalable_icon.exists())
+            self.assertFalse(png_icon.exists())
             self.assertFalse((bin_dir / "ws").exists())
             self.assertTrue(unrelated.is_symlink())
             self.assertEqual(os.readlink(unrelated), "other-tool")
@@ -1204,6 +1211,22 @@ class InstallerSafetyTests(unittest.TestCase):
             )
             self.assertIn("refusing to remove unrelated", result.stderr)
             self.assertTrue(command.exists())
+
+    def test_installer_preserves_unrelated_icon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            icon = home / ".local/share/icons/hicolor/scalable/apps/omarchy-session.svg"
+            icon.parent.mkdir(parents=True)
+            icon.write_text("<svg><title>Unrelated</title></svg>\n")
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+
+            result = subprocess.run(
+                ["bash", str(INSTALLER), "--copy"], env=env,
+                check=True, capture_output=True, text=True,
+            )
+            self.assertIn("refusing to replace unrelated", result.stderr)
+            self.assertEqual(icon.read_text(), "<svg><title>Unrelated</title></svg>\n")
 
     def test_installer_preserves_unrelated_super_space_launcher_entry(self):
         with tempfile.TemporaryDirectory() as tmp:

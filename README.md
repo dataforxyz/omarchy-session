@@ -1,5 +1,9 @@
 # omarchy-session
 
+<p align="center">
+  <img src="assets/omarchy-session.svg" width="144" height="144" alt="omarchy-session Saved Grid logo">
+</p>
+
 [![CI](https://github.com/dataforxyz/omarchy-session/actions/workflows/ci.yml/badge.svg)](https://github.com/dataforxyz/omarchy-session/actions/workflows/ci.yml)
 
 Save and restore Hyprland workspaces on Omarchy-style Linux desktops.
@@ -312,6 +316,14 @@ Treat these files as private. They may contain window titles, working
 directories, process arguments, hostnames, monitor/workspace names, and local
 agent session identifiers. Review and redact saved state before posting logs,
 screenshots, fixtures, or bug reports.
+
+## Icon and branding
+
+The **Saved Grid** mark combines a four-window workspace layout with a mint
+bookmark for saved session state. Vector, symbolic, preview, and launcher-size
+PNG assets are available under [`assets/`](assets/). The installer registers the
+icon in the user's hicolor icon theme and uses it for the Super+Space
+**Workspace Sessions** launcher entry.
 
 ## More documentation
 

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">omarchy-session Saved Grid icon</title>
+  <desc id="desc">A four-window workspace grid with a bookmark indicating a saved session.</desc>
+  <rect width="512" height="512" rx="112" fill="#5E6CFF"/>
+  <g fill="#F2F4FF">
+    <rect x="116" y="116" width="116" height="104" rx="20"/>
+    <rect x="248" y="116" width="148" height="104" rx="20"/>
+    <rect x="116" y="236" width="176" height="160" rx="20"/>
+    <rect x="308" y="236" width="88" height="160" rx="20"/>
+  </g>
+  <path d="M320 276c0-11 9-20 20-20h40c11 0 20 9 20 20v132l-40-26-40 26V276z" fill="#70E0C1"/>
+</svg>
