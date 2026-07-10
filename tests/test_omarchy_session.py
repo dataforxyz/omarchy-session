@@ -852,10 +852,11 @@ class SessionActionMenuTests(unittest.TestCase):
             mod.open_command_terminal("plan-path", "/tmp/session.json")
 
         argv, kwargs = calls[0]
-        self.assertEqual(argv[:5], [
-            "xdg-terminal-exec", "--title=Omarchy Session", "--hold", "--",
-            str(Path(mod.__file__).resolve()),
+        self.assertEqual(argv[:6], [
+            "xdg-terminal-exec", "--title=Omarchy Session", "--",
+            "bash", "-lc", '"$@"; status=$?; printf "\\nPress Enter to close…"; read -r _; exit "$status"',
         ])
+        self.assertEqual(argv[-3], str(Path(mod.__file__).resolve()))
         self.assertEqual(argv[-2:], ["plan-path", "/tmp/session.json"])
         self.assertTrue(kwargs["start_new_session"])
 
