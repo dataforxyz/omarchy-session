@@ -3059,9 +3059,13 @@ def open_command_terminal(*args: str) -> None:
     # working directory. __file__ always identifies the installed/source script.
     command = str(Path(__file__).resolve())
     if shutil.which("xdg-terminal-exec"):
+        # Alacritty's desktop entry does not implement xdg-terminal-exec's
+        # optional --hold action. Keep the terminal open portably with a shell
+        # prompt after the read-only command finishes.
+        script = '"$@"; status=$?; printf "\\nPress Enter to close…"; read -r _; exit "$status"'
         subprocess.Popen([
-            "xdg-terminal-exec", "--title=Omarchy Session", "--hold", "--",
-            command, *args,
+            "xdg-terminal-exec", "--title=Omarchy Session", "--",
+            "bash", "-lc", script, "omarchy-session-menu", command, *args,
         ], start_new_session=True)
     else:
         subprocess.Popen([command, *args], start_new_session=True)
