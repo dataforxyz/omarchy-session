@@ -255,12 +255,9 @@ def resolve_pi_session_arg(session_arg: str, cwd: str) -> str:
 
 
 def explicit_pi_session_from_argv(argv: list[str], cwd: str) -> str:
-    for i, arg in enumerate(argv):
-        if arg == "--session" and i + 1 < len(argv):
-            return resolve_pi_session_arg(argv[i + 1], cwd)
-        if arg.startswith("--session="):
-            return resolve_pi_session_arg(arg.split("=", 1)[1], cwd)
-    return ""
+    args = command_tail(argv, "pi")
+    session_arg = option_value(args, {"--session", "--session-id"})
+    return resolve_pi_session_arg(session_arg, cwd) if session_arg else ""
 
 
 def argv_invokes_pi(argv: list[str]) -> bool:
@@ -292,6 +289,80 @@ def proc_start_time(pid: int) -> float:
         return 0
 
 
+def timestamp_epoch(value) -> float:
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number / 1000 if number > 10_000_000_000 else number
+    if not isinstance(value, str) or not value:
+        return 0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0
+
+
+def jsonl_activity_distance(path: Path | str, process_start: float) -> float:
+    """Closest recorded JSONL event timestamp to a process start time."""
+    if not process_start:
+        return float("inf")
+    best = float("inf")
+    try:
+        with Path(path).open(errors="ignore") as handle:
+            for line in handle:
+                if "timestamp" not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                values = [record.get("timestamp")]
+                payload = record.get("payload") or {}
+                if isinstance(payload, dict):
+                    values.append(payload.get("timestamp"))
+                for value in values:
+                    event_time = timestamp_epoch(value)
+                    if event_time:
+                        best = min(best, abs(event_time - process_start))
+                        if best < 0.5:
+                            return best
+    except Exception:
+        pass
+    return best
+
+
+def session_process_score(path: Path | str, process_start: float, created_at: float = 0) -> tuple[float, float]:
+    path = Path(path)
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        mtime = 0
+    if not process_start:
+        return (float("inf"), -mtime)
+    distances = [jsonl_activity_distance(path, process_start)]
+    if created_at:
+        distances.append(abs(created_at - process_start))
+    if mtime:
+        distances.append(abs(mtime - process_start))
+    return (min(distances), -mtime)
+
+
+def command_tail(argv: list[str], command: str) -> list[str]:
+    for i, arg in enumerate(argv):
+        if Path(arg).name == command:
+            return argv[i + 1:]
+    return []
+
+
+def option_value(args: list[str], names: set[str]) -> str:
+    for i, arg in enumerate(args):
+        if arg in names and i + 1 < len(args) and not args[i + 1].startswith("-"):
+            return args[i + 1]
+        for name in names:
+            if arg.startswith(name + "="):
+                return arg.split("=", 1)[1]
+    return ""
+
+
 def pi_session_created_at(session: str) -> float:
     match = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z_", Path(session).name)
     if match:
@@ -313,16 +384,10 @@ def pi_sessions_for_process(cwd: str, pid: int) -> list[str]:
     if not sessions or not start:
         return sessions
 
-    def score(session: str) -> tuple[float, float]:
-        created = pi_session_created_at(session)
-        mtime = 0.0
-        try:
-            mtime = Path(session).stat().st_mtime
-        except Exception:
-            pass
-        return (abs(created - start) if created else float("inf"), -mtime)
-
-    return sorted(sessions, key=score)
+    return sorted(
+        sessions,
+        key=lambda session: session_process_score(session, start, pi_session_created_at(session)),
+    )
 
 
 def pi_title_label(title: str) -> str:
@@ -403,10 +468,9 @@ def choose_unused_session(tool: str, sessions: list[str], used_sessions: dict[st
         if session not in used:
             used.add(session)
             return session
-    if sessions:
-        # If every candidate is already consumed, keep a deterministic fallback
-        # but still return a usable session rather than dropping resume support.
-        return sessions[0]
+    # Reusing a consumed candidate silently opens the wrong conversation when
+    # multiple windows share a cwd. An empty result lets the caller use a picker
+    # or a plain-tool fallback instead of duplicating another window's session.
     return ""
 
 
@@ -416,15 +480,26 @@ def claude_project_dir_for_cwd(cwd: str, project_root: Path = CLAUDE_PROJECT_ROO
     return project_root / re.sub(r"[^A-Za-z0-9]", "-", cwd)
 
 
-def latest_claude_session_for_cwd(cwd: str, project_root: Path = CLAUDE_PROJECT_ROOT) -> str:
+def claude_sessions_for_cwd(cwd: str, project_root: Path = CLAUDE_PROJECT_ROOT) -> list[Path]:
     session_dir = claude_project_dir_for_cwd(cwd, project_root)
     try:
         sessions = [p for p in session_dir.glob("*.jsonl") if p.is_file()]
     except Exception:
-        return ""
-    if not sessions:
-        return ""
-    return max(sessions, key=lambda p: p.stat().st_mtime).stem
+        return []
+    return sorted(sessions, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def claude_sessions_for_process(cwd: str, pid: int, project_root: Path = CLAUDE_PROJECT_ROOT) -> list[str]:
+    sessions = claude_sessions_for_cwd(cwd, project_root)
+    start = proc_start_time(pid)
+    if start:
+        sessions.sort(key=lambda path: session_process_score(path, start))
+    return [path.stem for path in sessions]
+
+
+def explicit_claude_session_from_argv(argv: list[str]) -> str:
+    args = command_tail(argv, "claude")
+    return option_value(args, {"--resume", "-r", "--session-id"})
 
 
 def claude_project_root_from_env(env: dict[str, str]) -> Path:
@@ -441,6 +516,10 @@ def restore_launcher_from_env(env: dict[str, str], keys: tuple[str, ...], defaul
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", launcher) and shutil.which(launcher):
             return launcher
     return default
+
+
+def pi_command_from_env(env: dict[str, str]) -> str:
+    return restore_launcher_from_env(env, ("OMARCHY_SESSION_PI_COMMAND",), "pi")
 
 
 def claude_command_from_env(env: dict[str, str]) -> str:
@@ -460,52 +539,105 @@ def codex_command_from_process(_argv: list[str], env: dict[str, str]) -> str:
     )
 
 
+def opencode_command_from_env(env: dict[str, str]) -> str:
+    return restore_launcher_from_env(env, ("OMARCHY_SESSION_OPENCODE_COMMAND",), "opencode")
+
+
 def codex_session_root_from_env(env: dict[str, str]) -> Path:
     codex_home = env.get("CODEX_HOME") or ""
     return Path(codex_home).expanduser() / "sessions" if codex_home else CODEX_SESSION_ROOT
 
 
-def latest_codex_session_for_cwd(cwd: str, session_root: Path = CODEX_SESSION_ROOT) -> str:
+def codex_session_metadata(path: Path) -> tuple[str, str, float] | None:
     try:
-        sessions = [p for p in session_root.rglob("*.jsonl") if p.is_file()]
+        with path.open(errors="ignore") as handle:
+            meta = json.loads(handle.readline())
+        payload = meta.get("payload") or {}
+        source = payload.get("source") or {}
+        if payload.get("thread_source") == "subagent" or (
+            isinstance(source, dict) and source.get("subagent")
+        ):
+            return None
+        session_id = payload.get("id") or payload.get("session_id") or ""
+        cwd = payload.get("cwd") or ""
+        created = timestamp_epoch(payload.get("timestamp") or meta.get("timestamp"))
+        return (str(session_id), cwd, created) if session_id and cwd else None
     except Exception:
-        return ""
-    best: tuple[float, str] = (0, "")
-    for path in sessions:
-        try:
-            first = path.open(errors="ignore").readline()
-            meta = json.loads(first)
-            payload = meta.get("payload") or {}
-            if payload.get("cwd") != cwd:
-                continue
-            session_id = payload.get("id") or ""
-            if not session_id:
-                continue
-            mtime = path.stat().st_mtime
-            if mtime > best[0]:
-                best = (mtime, session_id)
-        except Exception:
-            continue
-    return best[1]
+        return None
 
 
-def latest_opencode_session_for_cwd(cwd: str) -> str:
-    if not OPENCODE_DB.exists():
-        return ""
+def codex_sessions_for_cwd(cwd: str, session_root: Path = CODEX_SESSION_ROOT) -> list[tuple[Path, str, float]]:
     try:
-        with sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True) as conn:
-            row = conn.execute(
-                """
-                select id from session
-                where directory = ? or path = ?
-                order by time_updated desc
-                limit 1
-                """,
-                (cwd, cwd),
-            ).fetchone()
+        paths = [p for p in session_root.rglob("*.jsonl") if p.is_file()]
     except Exception:
-        return ""
-    return row[0] if row else ""
+        return []
+    sessions: list[tuple[Path, str, float]] = []
+    for path in paths:
+        metadata = codex_session_metadata(path)
+        if metadata and metadata[1] == cwd:
+            sessions.append((path, metadata[0], metadata[2]))
+    sessions.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
+    return sessions
+
+
+def codex_sessions_for_process(cwd: str, pid: int, session_root: Path = CODEX_SESSION_ROOT) -> list[str]:
+    sessions = codex_sessions_for_cwd(cwd, session_root)
+    start = proc_start_time(pid)
+    if start:
+        sessions.sort(key=lambda item: session_process_score(item[0], start, item[2]))
+    return [session_id for _, session_id, _ in sessions]
+
+
+def explicit_codex_session_from_argv(argv: list[str]) -> str:
+    args = command_tail(argv, "codex")
+    for i, arg in enumerate(args):
+        if arg in {"resume", "fork"} and i + 1 < len(args) and not args[i + 1].startswith("-"):
+            return args[i + 1]
+    return ""
+
+
+def opencode_db_from_env(env: dict[str, str]) -> Path:
+    data_home = env.get("XDG_DATA_HOME") or ""
+    return Path(data_home).expanduser() / "opencode/opencode.db" if data_home else OPENCODE_DB
+
+
+def opencode_sessions_for_process(cwd: str, pid: int, db_path: Path = OPENCODE_DB) -> list[str]:
+    if not db_path.exists():
+        return []
+    start_ms = int(proc_start_time(pid) * 1000)
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        rows = conn.execute(
+            """
+            select id, time_created, time_updated from session
+            where parent_id is null and (directory = ? or path = ?)
+            order by time_updated desc
+            """,
+            (cwd, cwd),
+        ).fetchall()
+        if not start_ms:
+            return [row[0] for row in rows]
+        scored = []
+        for session_id, created, updated in rows:
+            activity = conn.execute(
+                "select min(abs(time_created - ?)) from message where session_id = ?",
+                (start_ms, session_id),
+            ).fetchone()[0]
+            distances = [abs(created - start_ms), abs(updated - start_ms)]
+            if activity is not None:
+                distances.append(activity)
+            scored.append((min(distances), -updated, session_id))
+        return [session_id for _, _, session_id in sorted(scored)]
+    except Exception:
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def explicit_opencode_session_from_argv(argv: list[str]) -> str:
+    return option_value(command_tail(argv, "opencode"), {"--session", "-s"})
 
 
 def make_restore_argv(argv: list[str]) -> list[str]:
@@ -535,68 +667,117 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
             continue
         argv = read_proc_argv(child_pid)
         exe = Path(argv[0]).name if argv else ""
-        explicit_session = explicit_pi_session_from_argv(argv, cwd)
-        if explicit_session and argv_invokes_pi(argv):
-            used_sessions.setdefault("pi", set()).add(explicit_session)
-            return cwd, ["pi", "--session", explicit_session], {
-                "tool": "pi",
-                "id": explicit_session,
-                "path": explicit_session,
-                "match": "argv-session",
-            }
-        if argv_has_pi_continue(argv):
-            return cwd, ["pi", "--continue"], {"tool": "pi", "id": "latest", "match": "argv-continue"}
-
-        if exe == "pi":
-            sessions = pi_sessions_for_process(cwd, child_pid)
-            session = choose_unused_session("pi", sessions, used_sessions)
+        if argv_invokes_pi(argv):
+            env = read_proc_environ(child_pid)
+            command = pi_command_from_env(env)
+            pi_args = command_tail(argv, "pi")
+            if "--no-session" in pi_args:
+                return cwd, [command], {}
+            explicit_session = explicit_pi_session_from_argv(argv, cwd)
+            if explicit_session:
+                used_sessions.setdefault("pi", set()).add(explicit_session)
+                return cwd, [command, "--session", explicit_session], {
+                    "tool": "pi", "id": explicit_session, "path": explicit_session,
+                    "command": command, "match": "argv-session",
+                }
+            session = choose_unused_session("pi", pi_sessions_for_process(cwd, child_pid), used_sessions)
             if session:
-                return cwd, ["pi", "--session", session], {"tool": "pi", "id": session, "path": session, "match": "cwd-process-start"}
-            return cwd, ["pi", "--continue"], {"tool": "pi", "id": "latest", "match": "continue"}
+                return cwd, [command, "--session", session], {
+                    "tool": "pi", "id": session, "path": session,
+                    "command": command, "match": "process-activity",
+                }
+            if argv_has_pi_continue(argv) or exe == "pi":
+                return cwd, [command, "--resume"], {
+                    "tool": "pi", "id": "picker", "command": command,
+                    "match": "picker-fallback",
+                }
 
         if exe == "claude":
             env = read_proc_environ(child_pid)
             command = claude_command_from_env(env)
             project_root = claude_project_root_from_env(env)
-            session = latest_claude_session_for_cwd(cwd, project_root)
+            used_key = f"claude:{project_root}"
+            explicit_session = explicit_claude_session_from_argv(argv)
+            if explicit_session:
+                used_sessions.setdefault(used_key, set()).add(explicit_session)
+                session = explicit_session
+                match = "argv-session"
+            else:
+                session = choose_unused_session(
+                    used_key,
+                    claude_sessions_for_process(cwd, child_pid, project_root),
+                    used_sessions,
+                )
+                match = "process-activity"
             if session:
                 return cwd, [command, "--resume", session], {
-                    "tool": "claude",
-                    "id": session,
-                    "command": command,
-                    "projectRoot": str(project_root),
+                    "tool": "claude", "id": session, "command": command,
+                    "projectRoot": str(project_root), "match": match,
                 }
-            return cwd, [command, "--continue"], {
-                "tool": "claude",
-                "id": "latest",
-                "command": command,
-                "projectRoot": str(project_root),
+            return cwd, [command, "--resume"], {
+                "tool": "claude", "id": "picker", "command": command,
+                "projectRoot": str(project_root), "match": "picker-fallback",
             }
 
         if exe == "codex":
             env = read_proc_environ(child_pid)
             command = codex_command_from_process(argv, env)
             session_root = codex_session_root_from_env(env)
-            session = latest_codex_session_for_cwd(cwd, session_root)
+            used_key = f"codex:{session_root}"
+            explicit_session = explicit_codex_session_from_argv(argv)
+            if explicit_session:
+                used_sessions.setdefault(used_key, set()).add(explicit_session)
+                session = explicit_session
+                match = "argv-session"
+            else:
+                session = choose_unused_session(
+                    used_key,
+                    codex_sessions_for_process(cwd, child_pid, session_root),
+                    used_sessions,
+                )
+                match = "process-activity"
             if session:
                 return cwd, [command, "resume", session], {
                     "tool": "codex", "id": session, "command": command,
-                    "sessionRoot": str(session_root),
+                    "sessionRoot": str(session_root), "match": match,
                 }
-            return cwd, [command, "resume", "--last"], {
-                "tool": "codex", "id": "latest", "command": command,
-                "sessionRoot": str(session_root),
+            return cwd, [command, "resume"], {
+                "tool": "codex", "id": "picker", "command": command,
+                "sessionRoot": str(session_root), "match": "picker-fallback",
             }
 
         if exe == "opencode":
-            session = latest_opencode_session_for_cwd(cwd)
+            env = read_proc_environ(child_pid)
+            command = opencode_command_from_env(env)
+            db_path = opencode_db_from_env(env)
+            used_key = f"opencode:{db_path}"
+            explicit_session = explicit_opencode_session_from_argv(argv)
+            if explicit_session:
+                used_sessions.setdefault(used_key, set()).add(explicit_session)
+                session = explicit_session
+                match = "argv-session"
+            else:
+                session = choose_unused_session(
+                    used_key,
+                    opencode_sessions_for_process(cwd, child_pid, db_path),
+                    used_sessions,
+                )
+                match = "process-activity"
             if session:
                 # OpenCode's session store exposes stable ses_* IDs. Some
                 # versions accept --session; if a future/older wrapper rejects
                 # it, fall back to plain opencode in the saved directory.
-                cmd = f"opencode --session {shlex.quote(session)} || opencode"
-                return cwd, ["sh", "-lc", cmd], {"tool": "opencode", "id": session}
-            return cwd, ["opencode"], {"tool": "opencode", "id": "latest"}
+                quoted_command = shlex.quote(command)
+                cmd = f"{quoted_command} --session {shlex.quote(session)} || {quoted_command}"
+                return cwd, ["sh", "-lc", cmd], {
+                    "tool": "opencode", "id": session, "command": command,
+                    "database": str(db_path), "match": match,
+                }
+            return cwd, [command], {
+                "tool": "opencode", "id": "latest", "command": command,
+                "database": str(db_path),
+                "match": "plain-fallback",
+            }
 
     # Otherwise preserve the user's wrapper command for known interactive Make
     # targets. This keeps workflows like `make ssh` and remote `make pi N=docs`
@@ -1814,19 +1995,19 @@ def terminal_restore_argv(win: dict) -> list[str]:
 
     agent = win.get("agentSession") or {}
     if agent.get("tool") == "pi" and agent.get("path"):
-        return ["pi", "--session", agent.get("path")]
+        return [agent.get("command") or "pi", "--session", agent.get("path")]
     if agent.get("tool") == "claude" and agent.get("command"):
         command = agent.get("command")
         session = agent.get("id") or ""
-        if session and session != "latest":
+        if session and session not in {"latest", "picker"}:
             return [command, "--resume", session]
-        return [command, "--continue"]
+        return [command, "--resume"] if session == "picker" else [command, "--continue"]
     if agent.get("tool") == "codex":
         command = agent.get("command") or "codex"
         session = agent.get("id") or ""
-        if session and session != "latest":
+        if session and session not in {"latest", "picker"}:
             return [command, "resume", session]
-        return [command, "resume", "--last"]
+        return [command, "resume"] if session == "picker" else [command, "resume", "--last"]
 
     # Legacy saves made before a terminal class was supported may still have a
     # useful title but no child-process restore metadata. Reopen the obvious

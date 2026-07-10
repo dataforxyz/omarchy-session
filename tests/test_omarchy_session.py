@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -506,11 +507,13 @@ class PiSessionDetectionTests(unittest.TestCase):
             self.assertEqual(agent["path"], str(session))
             self.assertEqual(agent["match"], "argv-session")
 
-    def test_terminal_child_state_preserves_pi_continue_arg(self):
+    def test_terminal_child_state_resolves_pi_continue_to_exact_session(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as tmp:
             cwd = Path(tmp) / "project"
             cwd.mkdir()
+            session = Path(tmp) / "continued.jsonl"
+            session.write_text(json.dumps({"type": "session", "id": "continued", "cwd": str(cwd)}) + "\n")
 
             def fake_cwd(pid):
                 return str(cwd) if pid in {101, 102} else ""
@@ -524,14 +527,14 @@ class PiSessionDetectionTests(unittest.TestCase):
 
             mod.read_proc_cwd = fake_cwd
             mod.read_proc_argv = fake_argv
-            mod.pi_sessions_for_process = lambda seen_cwd, pid: self.fail("--continue should not use process-start scoring")
+            mod.pi_sessions_for_process = lambda seen_cwd, pid: [str(session)]
 
             workdir, restore_argv, agent = mod.terminal_child_state(100, str(cwd), {100: [101], 101: [102]}, {})
 
             self.assertEqual(workdir, str(cwd))
-            self.assertEqual(restore_argv, ["pi", "--continue"])
-            self.assertEqual(agent["id"], "latest")
-            self.assertEqual(agent["match"], "argv-continue")
+            self.assertEqual(restore_argv, ["pi", "--session", str(session)])
+            self.assertEqual(agent["id"], str(session))
+            self.assertEqual(agent["match"], "process-activity")
 
     def test_pi_continue_flag_must_follow_pi_arg(self):
         mod = load_module()
@@ -564,7 +567,129 @@ class PiSessionDetectionTests(unittest.TestCase):
             self.assertEqual(workdir, str(cwd))
             self.assertEqual(restore_argv, ["pi", "--session", str(current)])
             self.assertEqual(agent["path"], str(current))
-            self.assertEqual(agent["match"], "cwd-process-start")
+            self.assertEqual(agent["match"], "process-activity")
+
+
+class AgentSessionMatchingTests(unittest.TestCase):
+    def test_explicit_session_arguments_are_preserved_for_all_agents(self):
+        mod = load_module()
+        self.assertEqual(mod.explicit_claude_session_from_argv(["claude", "--resume", "claude-id"]), "claude-id")
+        self.assertEqual(mod.explicit_claude_session_from_argv(["claude", "--session-id=claude-new"]), "claude-new")
+        self.assertEqual(mod.explicit_codex_session_from_argv(["codex", "resume", "codex-id"]), "codex-id")
+        self.assertEqual(mod.explicit_opencode_session_from_argv(["opencode", "--session", "ses_exact"]), "ses_exact")
+
+    def test_codex_candidates_filter_subagents_and_match_process_activity(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            root.mkdir()
+            cwd = str(Path(tmp) / "project")
+
+            def write_session(name, session_id, timestamp, thread_source="user"):
+                path = root / name
+                path.write_text(json.dumps({
+                    "timestamp": timestamp,
+                    "payload": {
+                        "id": session_id,
+                        "cwd": cwd,
+                        "timestamp": timestamp,
+                        "thread_source": thread_source,
+                        "source": {"subagent": {}} if thread_source == "subagent" else "cli",
+                    },
+                }) + "\n")
+                return path
+
+            write_session("a.jsonl", "session-a", "2026-01-01T00:00:10Z")
+            write_session("b.jsonl", "session-b", "2026-01-01T00:01:40Z")
+            write_session("subagent.jsonl", "wrong-subagent", "2026-01-01T00:00:11Z", "subagent")
+            mod.proc_start_time = lambda pid: mod.timestamp_epoch("2026-01-01T00:00:09Z")
+
+            self.assertEqual(
+                mod.codex_sessions_for_process(cwd, 123, root),
+                ["session-a", "session-b"],
+            )
+
+    def test_same_cwd_windows_get_distinct_sessions_for_all_agents(self):
+        mod = load_module()
+        cwd = "/tmp/project"
+        used = {}
+        mod.read_proc_cwd = lambda pid: cwd
+        mod.read_proc_environ = lambda pid: {}
+
+        mod.pi_sessions_for_process = lambda seen_cwd, pid: ["/tmp/pi-a.jsonl", "/tmp/pi-b.jsonl"]
+        mod.read_proc_argv = lambda pid: ["pi"]
+        first = mod.terminal_child_state(9, cwd, {9: [901]}, used)
+        second = mod.terminal_child_state(10, cwd, {10: [1001]}, used)
+        third = mod.terminal_child_state(11, cwd, {11: [1101]}, used)
+        self.assertEqual(first[2]["id"], "/tmp/pi-a.jsonl")
+        self.assertEqual(second[2]["id"], "/tmp/pi-b.jsonl")
+        self.assertEqual(third[1], ["pi", "--resume"])
+        self.assertEqual(third[2]["match"], "picker-fallback")
+
+        mod.claude_sessions_for_process = lambda seen_cwd, pid, root: ["claude-a", "claude-b"]
+        mod.read_proc_argv = lambda pid: ["claude"]
+        first = mod.terminal_child_state(1, cwd, {1: [101]}, used)
+        second = mod.terminal_child_state(2, cwd, {2: [201]}, used)
+        third = mod.terminal_child_state(7, cwd, {7: [701]}, used)
+        self.assertEqual(first[2]["id"], "claude-a")
+        self.assertEqual(second[2]["id"], "claude-b")
+        self.assertEqual(third[1], ["claude", "--resume"])
+        self.assertEqual(third[2]["match"], "picker-fallback")
+
+        mod.codex_sessions_for_process = lambda seen_cwd, pid, root: ["codex-a", "codex-b"]
+        mod.read_proc_argv = lambda pid: ["codex"]
+        first = mod.terminal_child_state(3, cwd, {3: [301]}, used)
+        second = mod.terminal_child_state(4, cwd, {4: [401]}, used)
+        third = mod.terminal_child_state(8, cwd, {8: [801]}, used)
+        self.assertEqual(first[2]["id"], "codex-a")
+        self.assertEqual(second[2]["id"], "codex-b")
+        self.assertEqual(third[1], ["codex", "resume"])
+        self.assertEqual(third[2]["match"], "picker-fallback")
+
+        mod.opencode_sessions_for_process = lambda seen_cwd, pid, db: ["ses_a", "ses_b"]
+        mod.read_proc_argv = lambda pid: ["opencode"]
+        first = mod.terminal_child_state(5, cwd, {5: [501]}, used)
+        second = mod.terminal_child_state(6, cwd, {6: [601]}, used)
+        self.assertEqual(first[2]["id"], "ses_a")
+        self.assertEqual(second[2]["id"], "ses_b")
+
+    def test_opencode_candidates_filter_child_sessions_and_match_message_activity(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "opencode.db"
+            cwd = "/tmp/project"
+            conn = sqlite3.connect(db)
+            try:
+                conn.executescript("""
+                    create table session (
+                        id text primary key, parent_id text, directory text, path text,
+                        time_created integer, time_updated integer
+                    );
+                    create table message (
+                        id text primary key, session_id text, time_created integer, time_updated integer
+                    );
+                """)
+                conn.executemany(
+                    "insert into session values (?, ?, ?, ?, ?, ?)",
+                    [
+                        ("ses_a", None, cwd, cwd, 10_000, 500_000),
+                        ("ses_b", None, cwd, cwd, 20_000, 600_000),
+                        ("ses_child", "ses_a", cwd, cwd, 100_000, 700_000),
+                    ],
+                )
+                conn.executemany(
+                    "insert into message values (?, ?, ?, ?)",
+                    [
+                        ("msg-a", "ses_a", 100_100, 100_100),
+                        ("msg-b", "ses_b", 300_000, 300_000),
+                        ("msg-child", "ses_child", 100_050, 100_050),
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            mod.proc_start_time = lambda pid: 100
+            self.assertEqual(mod.opencode_sessions_for_process(cwd, 123, db), ["ses_a", "ses_b"])
 
 
 class RestoreCommandTests(unittest.TestCase):

@@ -124,9 +124,17 @@ metadata is available:
 - Codex: `codex resume <id>`
 - OpenCode: its saved `ses_*` identifier when supported
 
-A wrapper that eventually executes Claude Code or Codex can advertise the
-command that should be used during restore. Export the variable before `exec` so
-it remains visible in the agent process:
+Session matching first preserves an explicit ID already present in the running
+process arguments. Otherwise it compares process start time with recorded session
+activity and assigns each terminal an unused candidate, so multiple windows in
+the same directory do not all receive the same conversation. Codex subagent
+threads and OpenCode child sessions are excluded. If no unique match is safe, the
+tool opens the agent's session picker (or plain OpenCode) instead of silently
+resuming another window's latest session.
+
+A wrapper that eventually executes an agent can advertise the command that
+should be used during restore. Export the corresponding variable before `exec`
+so it remains visible in the agent process:
 
 ```bash
 #!/usr/bin/env bash
@@ -140,9 +148,12 @@ export OMARCHY_SESSION_CLAUDE_COMMAND=my-claude
 exec claude "$@"
 ```
 
-The advertised value must be a simple executable name available on `PATH`.
-Codex wrappers that set `CODEX_HOME` are also supported; session lookup follows
-that home instead of assuming `~/.codex`.
+Supported variables are `OMARCHY_SESSION_PI_COMMAND`,
+`OMARCHY_SESSION_CLAUDE_COMMAND`, `OMARCHY_SESSION_CODEX_COMMAND`, and
+`OMARCHY_SESSION_OPENCODE_COMMAND`. The advertised value must be a simple
+executable name available on `PATH`. Codex wrappers that set `CODEX_HOME` are
+also supported; session lookup follows that home instead of assuming
+`~/.codex`.
 
 ## Dry-run and verification
 
