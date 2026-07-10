@@ -18,6 +18,7 @@ an audit report.
 - Workspace, monitor, scratchpad, floating, and fullscreen restoration
 - Best-effort Hyprland group/tab reconstruction
 - Terminal working-directory restoration for Ghostty and Alacritty
+- Neovim/Vim relaunch with the saved working directory and command-line arguments
 - Session resume support for Pi, Claude Code, Codex, and OpenCode
 - Soft undo for the previous layout and hard undo for newly launched windows
 - Post-restore verification with concise failure summaries and a JSON audit
@@ -163,6 +164,19 @@ Restoration is intentionally best effort. Applications such as browsers may
 reuse an existing process, tab, or window rather than create a new Hyprland
 window. Unsupported app classes are skipped and recorded for review rather than
 executed blindly.
+
+## Terminal editors
+
+When Neovim or Vim is running directly inside Ghostty or Alacritty, the saved
+terminal restore command preserves its argv and working directory. For example,
+`nvim README.md src/main.py` is relaunched with those files in the same project
+directory. This also supports `vim` and `vi`.
+
+This is command-level restoration, not an editor-state snapshot. Neovim session
+state that was not represented by its command line—unsaved buffers, cursor
+positions, tabs, splits, and plugin state—requires Neovim's own session or
+persistence tooling. A Neovim instance running inside a persistent tmux session
+can instead be recovered when the saved tmux command reconnects successfully.
 
 ## Terminal agents and custom wrappers
 
