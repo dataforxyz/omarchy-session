@@ -270,6 +270,45 @@ class DryRunTests(unittest.TestCase):
         partial = next(a for a in assessments if a["status"] == "partial_missing")
         self.assertEqual(partial["missingSavedAddresses"], ["0x6"])
 
+    def test_dry_run_matches_live_terminal_when_session_id_temporarily_changes(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp) / "session.json"
+            saved = {
+                "address": "0xsaved", "class": "Alacritty", "title": "⠏ cpmex",
+                "workspace": {"id": 4, "name": "4"}, "monitorName": "eDP-1",
+                "restoreWorkdir": "/tmp/project",
+                "agentSession": {"tool": "codex", "id": "picker", "command": "coi"},
+            }
+            current = {
+                "address": "0xcurrent", "class": "Alacritty", "title": "⠹ cpmex",
+                "workspace": {"id": 4, "name": "4"}, "monitorName": "eDP-1",
+                "restoreWorkdir": "/tmp/project",
+                "agentSession": {"tool": "codex", "id": "exact-id", "command": "coi"},
+            }
+            session.write_text(json.dumps({"windows": [saved]}))
+            mod.collect_windows = lambda: [current]
+            mod.raw_monitors = lambda: [{"name": "eDP-1"}]
+            mod.launch_command = lambda win: self.fail("matching live terminal must not be planned for launch")
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                mod.restore_dry_run(session)
+
+            text = out.getvalue()
+            self.assertIn("already open: workspace 4: Alacritty", text)
+            self.assertIn("Monitor actions: none", text)
+            self.assertIn("would launch 0", text)
+
+    def test_picker_fallback_is_not_treated_as_an_authoritative_session_id(self):
+        mod = load_module()
+        win = {
+            "class": "Alacritty", "workspace": {"id": 4, "name": "4"},
+            "restoreWorkdir": "/tmp/project",
+            "agentSession": {"tool": "codex", "id": "picker"},
+        }
+        self.assertEqual(mod.restore_key(win), "ws:4|class:alacritty|dir:/tmp/project")
+
     def test_hypr_retries_transient_dispatch_failure(self):
         mod = load_module()
         calls = []
@@ -1253,6 +1292,30 @@ class InstallerSafetyTests(unittest.TestCase):
             )
             self.assertIn("refusing to remove unrelated", result.stderr)
             self.assertTrue(command.exists())
+
+    def test_installer_restarts_enabled_autosave_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            service = home / ".config/systemd/user/omarchy-session-autosave.service"
+            service.parent.mkdir(parents=True)
+            service.write_text("[Service]\nExecStart=%h/.local/bin/omarchy-session autosave-loop\n")
+            fake_bin = home / "fake-bin"
+            fake_bin.mkdir()
+            systemctl = fake_bin / "systemctl"
+            systemctl.write_text("#!/bin/sh\necho \"$*\" >> \"$HOME/systemctl.log\"\nexit 0\n")
+            systemctl.chmod(0o755)
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+
+            subprocess.run(
+                ["bash", str(INSTALLER), "--copy"], env=env,
+                check=True, capture_output=True, text=True,
+            )
+
+            calls = (home / "systemctl.log").read_text()
+            self.assertIn("is-enabled --quiet omarchy-session-autosave.service", calls)
+            self.assertIn("restart omarchy-session-autosave.service", calls)
 
     def test_installer_preserves_unrelated_icon(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -122,6 +122,41 @@ DESKTOP
     echo "Installed Super+Space launcher entry: $DESKTOP_FILE"
 }
 
+restart_autosave_loop_if_configured() {
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-session"
+    local pid_file="$state_dir/autosave-loop.pid"
+    local old_pid=""
+    local was_running=0
+    local service_file="$HOME/.config/systemd/user/omarchy-session-autosave.service"
+    local service_enabled=0
+
+    if [[ -f "$pid_file" ]]; then
+        old_pid="$(cat "$pid_file" 2>/dev/null || true)"
+        if [[ "$old_pid" =~ ^[0-9]+$ ]] && [[ -r "/proc/$old_pid/cmdline" ]] \
+                && tr '\0' ' ' < "/proc/$old_pid/cmdline" | grep -Fq 'omarchy-session autosave-loop'; then
+            was_running=1
+            kill "$old_pid" 2>/dev/null || true
+        fi
+        rm -f "$pid_file"
+    fi
+
+    if [[ -f "$service_file" ]] && command -v systemctl >/dev/null 2>&1 \
+            && systemctl --user is-enabled --quiet omarchy-session-autosave.service 2>/dev/null; then
+        service_enabled=1
+    fi
+
+    if [[ -f "$service_file" ]] && command -v systemctl >/dev/null 2>&1 \
+            && [[ "$was_running" -eq 1 || "$service_enabled" -eq 1 ]]; then
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+        systemctl --user restart omarchy-session-autosave.service >/dev/null 2>&1 || true
+        echo "Restarted omarchy-session-autosave.service with the installed version"
+    elif [[ "$was_running" -eq 1 ]]; then
+        mkdir -p "$state_dir"
+        nohup "$BIN_DIR/omarchy-session" autosave-loop > "$state_dir/autosave-loop.log" 2>&1 &
+        echo "Restarted the running autosave loop with the installed version"
+    fi
+}
+
 install_alias() {
     local name="$1"
     local dest="$BIN_DIR/$name"
@@ -182,6 +217,7 @@ install_alias restore-workspace
 install_icons
 install_desktop_launcher
 chmod +x "$BIN_DIR/omarchy-session" 2>/dev/null || true
+restart_autosave_loop_if_configured
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$APPLICATIONS_DIR" >/dev/null 2>&1 || true
 fi

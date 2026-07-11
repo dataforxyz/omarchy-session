@@ -66,6 +66,10 @@ action to save one selected workspace as any named profile. Existing unrelated
 files, symlinks, or desktop entries with those names are left untouched unless
 `--force` is supplied.
 
+If an autosave loop is already configured or running, reinstalling automatically
+restarts it so future autosaves use the newly installed matching logic rather
+than an older in-memory copy of the script.
+
 For development, link the installed command to the checkout:
 
 ```bash
@@ -294,7 +298,11 @@ plan…** to choose default, any named profile, or an autosave before opening it
 plan. The terminal equivalent is `ws pick plan`.
 
 Dry-run mode does not launch applications, dispatch Hyprland commands, write
-undo/restore state, send notifications, or sleep between launches.
+undo/restore state, send notifications, or sleep between launches. Plans match
+live windows using exact session IDs when available, then compatible title and
+working-directory evidence; non-authoritative `picker` markers are never treated
+as real session IDs. Already-correct monitor placements are omitted rather than
+reported as changes.
 
 A real restore writes `last-restore-audit.json` with the before snapshot,
 intended targets, detected launches, after snapshot, group results, placement
