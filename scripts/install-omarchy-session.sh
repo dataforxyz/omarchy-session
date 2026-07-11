@@ -132,12 +132,15 @@ restart_autosave_loop_if_configured() {
 
     if [[ -f "$pid_file" ]]; then
         old_pid="$(cat "$pid_file" 2>/dev/null || true)"
-        if [[ "$old_pid" =~ ^[0-9]+$ ]] && [[ -r "/proc/$old_pid/cmdline" ]] \
-                && tr '\0' ' ' < "/proc/$old_pid/cmdline" | grep -Fq 'omarchy-session autosave-loop'; then
-            was_running=1
-            kill "$old_pid" 2>/dev/null || true
+        if [[ "$old_pid" =~ ^[0-9]+$ ]] && [[ -r "/proc/$old_pid/cmdline" ]]; then
+            if tr '\0' ' ' < "/proc/$old_pid/cmdline" | grep -Fq "$BIN_DIR/omarchy-session autosave-loop"; then
+                was_running=1
+                kill "$old_pid" 2>/dev/null || true
+                rm -f "$pid_file"
+            fi
+        else
+            rm -f "$pid_file"
         fi
-        rm -f "$pid_file"
     fi
 
     if [[ -f "$service_file" ]] && command -v systemctl >/dev/null 2>&1 \
