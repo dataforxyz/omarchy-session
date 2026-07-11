@@ -300,6 +300,21 @@ class DryRunTests(unittest.TestCase):
             self.assertIn("Monitor actions: none", text)
             self.assertIn("would launch 0", text)
 
+    def test_global_matching_reserves_a_spinner_title_match_before_generic_workdir_match(self):
+        mod = load_module()
+        common = {
+            "class": "Alacritty", "workspace": {"id": 7, "name": "7"},
+            "restoreWorkdir": "/tmp/project", "agentSession": {"tool": "claude", "id": "picker"},
+        }
+        generic = dict(common, address="0xgeneric", title="juston")
+        watcher = dict(common, address="0xwatcher", title="✳ watcher-status-check")
+        live_watcher = dict(common, address="0xlive", title="⠂ watcher-status-check")
+
+        matches = mod.match_existing_windows([generic, watcher], [live_watcher])
+
+        self.assertNotIn("0xgeneric", matches)
+        self.assertEqual(matches["0xwatcher"]["address"], "0xlive")
+
     def test_picker_fallback_is_not_treated_as_an_authoritative_session_id(self):
         mod = load_module()
         win = {
@@ -1292,6 +1307,27 @@ class InstallerSafetyTests(unittest.TestCase):
             )
             self.assertIn("refusing to remove unrelated", result.stderr)
             self.assertTrue(command.exists())
+
+    def test_installer_does_not_kill_pid_from_an_inconsistent_external_state_home(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as external:
+            home = Path(tmp)
+            state = Path(external) / "omarchy-session"
+            state.mkdir()
+            process = subprocess.Popen(["sleep", "30"])
+            try:
+                (state / "autosave-loop.pid").write_text(str(process.pid))
+                env = os.environ.copy()
+                env["HOME"] = str(home)
+                env["XDG_STATE_HOME"] = external
+                subprocess.run(
+                    ["bash", str(INSTALLER), "--copy"], env=env,
+                    check=True, capture_output=True, text=True,
+                )
+                self.assertIsNone(process.poll())
+                self.assertEqual((state / "autosave-loop.pid").read_text(), str(process.pid))
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
 
     def test_installer_restarts_enabled_autosave_service(self):
         with tempfile.TemporaryDirectory() as tmp:

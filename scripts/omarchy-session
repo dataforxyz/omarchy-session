@@ -1529,9 +1529,12 @@ def compatible_current_window(target: dict, candidate: dict) -> bool:
     return is_singleton(target)
 
 
+def normalized_window_title(win: dict) -> str:
+    title = (win.get("title") or "").strip()
+    return re.sub(r"^[\u2800-\u28ff✳*•·]+\s*", "", title)
+
+
 def candidate_match_score(target: dict, candidate: dict) -> int:
-    if restore_key(candidate) == restore_key(target):
-        return 100
     if lc_class(candidate) != lc_class(target):
         return 0
     if lc_class(target) in BROWSER_CLASSES:
@@ -1540,24 +1543,27 @@ def candidate_match_score(target: dict, candidate: dict) -> int:
         if "browserProfileArgs" in target and (target_profile or candidate_profile) and target_profile != candidate_profile:
             return 0
 
+    score = 100 if restore_key(candidate) == restore_key(target) else 0
     target_title = target.get("title") or ""
     candidate_title = candidate.get("title") or ""
     if target_title and candidate_title and target_title == candidate_title:
-        return 90
+        score = max(score, 90) + 20
+    elif normalized_window_title(target) and normalized_window_title(target) == normalized_window_title(candidate):
+        score = max(score, 88) + 20
 
     target_url, target_flags = browser_app_args(target)
     candidate_url, candidate_flags = browser_app_args(candidate)
     if target_url and candidate_url and target_url == candidate_url and target_flags == candidate_flags:
-        return 85
+        score = max(score, 85)
 
     target_workdir = target.get("restoreWorkdir") or ""
     candidate_workdir = candidate.get("restoreWorkdir") or ""
     if lc_class(target) in TERMINAL_CLASSES and target_workdir and target_workdir == candidate_workdir:
-        return 75
+        score = max(score, 75)
 
     if is_singleton(target):
-        return 60
-    return 0
+        score = max(score, 60)
+    return score
 
 
 def match_existing_windows(targets: list[dict], current_windows: list[dict]) -> dict[str, dict]:
@@ -1568,31 +1574,28 @@ def match_existing_windows(targets: list[dict], current_windows: list[dict]) -> 
     become temporarily unavailable while titles/workdirs still identify the same
     live terminal.
     """
-    used: set[str] = set()
+    remaining_targets = [target for target in targets if target.get("address")]
+    remaining_current = [candidate for candidate in current_windows if candidate.get("address")]
     matches: dict[str, dict] = {}
-    for target in targets:
-        saved_address = target.get("address") or ""
-        if not saved_address:
-            continue
-        candidates: list[tuple[int, dict]] = []
-        for candidate in current_windows:
-            current_address = candidate.get("address") or ""
-            if not current_address or current_address in used:
-                continue
-            score = candidate_match_score(target, candidate)
-            if score <= 0:
-                continue
-            if workspace_spec(target) == workspace_spec(candidate):
-                score += 10
-            if saved_address == current_address:
-                score += 5
-            candidates.append((score, candidate))
-        if not candidates:
-            continue
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        matched = candidates[0][1]
-        matches[saved_address] = matched
-        used.add(matched.get("address") or "")
+    while remaining_targets and remaining_current:
+        best: tuple[int, int, int] | None = None
+        for target_index, target in enumerate(remaining_targets):
+            for current_index, candidate in enumerate(remaining_current):
+                score = candidate_match_score(target, candidate)
+                if score <= 0:
+                    continue
+                if workspace_spec(target) == workspace_spec(candidate):
+                    score += 10
+                if target.get("address") == candidate.get("address"):
+                    score += 5
+                if best is None or score > best[0]:
+                    best = (score, target_index, current_index)
+        if best is None:
+            break
+        _, target_index, current_index = best
+        target = remaining_targets.pop(target_index)
+        matched = remaining_current.pop(current_index)
+        matches[target.get("address") or ""] = matched
     return matches
 
 
