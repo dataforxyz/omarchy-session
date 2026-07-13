@@ -211,7 +211,9 @@ Terminal restore behavior is best effort:
 
 - direct `nvim`, `vim`, and `vi` processes preserve their command-line arguments
   and working directory. This reopens command-line files such as
-  `nvim README.md src/main.py`, but does not independently capture unsaved
+  `nvim README.md src/main.py`. A captured Neovim `--embed` flag is removed
+  because replaying that RPC-backend mode without its original frontend creates
+  a blank terminal. Command-level restoration does not independently capture unsaved
   buffers, cursor positions, splits, tabs, or plugin state; use Neovim session
   or persistence tooling when that state must survive;
 - direct `pi` sessions restore with `pi --session <jsonl>` when matching Pi
