@@ -491,6 +491,18 @@ def make_restore_argv(argv: list[str]) -> list[str]:
     return []
 
 
+def safe_terminal_restore_argv(argv: list[str]) -> list[str]:
+    if not argv:
+        return []
+    exe = Path(argv[0]).name
+    if exe == "nvim":
+        # Embedded Neovim is an RPC backend whose UI is supplied by its parent.
+        # Replaying the child command alone leaves a blank terminal, so restore
+        # it as a normal interactive Neovim while preserving all other args.
+        return [arg for arg in argv if arg != "--embed"]
+    return argv
+
+
 def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]], used_sessions: dict[str, set[str]]) -> tuple[str, list[str], dict]:
     home = str(Path.home())
     best = (0, fallback)
@@ -656,9 +668,11 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
         cmd = " ".join(argv)
 
         if exe in DIRECT_RESTORE_COMMANDS and argv:
-            restore_argv = argv
-            restore_session = {}
-            best = (900 - depth, cwd)
+            direct_score = 900 - depth
+            if direct_score > best[0]:
+                restore_argv = safe_terminal_restore_argv(argv)
+                restore_session = {}
+                best = (direct_score, cwd)
             continue
 
         score = depth
@@ -2087,7 +2101,7 @@ def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str
 
 
 def terminal_restore_argv(win: dict) -> list[str]:
-    restore_argv = win.get("restoreArgv") or []
+    restore_argv = safe_terminal_restore_argv(win.get("restoreArgv") or [])
     if restore_argv:
         return restore_argv
 

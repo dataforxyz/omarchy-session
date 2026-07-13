@@ -1073,6 +1073,62 @@ class RestoreCommandTests(unittest.TestCase):
         self.assertEqual(restore_argv, ["nvim", "README.md", "src/main.py"])
         self.assertEqual(agent, {})
 
+    def test_embedded_neovim_is_restored_as_an_interactive_terminal_editor(self):
+        mod = load_module()
+        project = "/tmp/project"
+        mod.read_proc_environ = lambda pid: {}
+        mod.agent_registry_record = lambda tool, pid, env=None: {}
+        mod.read_proc_cwd = lambda pid: project if pid == 102 else "/tmp"
+        mod.read_proc_argv = lambda pid: {
+            101: ["xonsh"],
+            102: ["nvim", "--embed", "README.md"],
+        }.get(pid, [])
+
+        workdir, restore_argv, agent = mod.terminal_child_state(
+            100, "/tmp", {100: [101], 101: [102]}, {}
+        )
+
+        self.assertEqual(workdir, project)
+        self.assertEqual(restore_argv, ["nvim", "README.md"])
+        self.assertEqual(agent, {})
+
+    def test_terminal_capture_prefers_interactive_neovim_parent_over_embedded_backend(self):
+        mod = load_module()
+        project = "/tmp/project"
+        mod.read_proc_environ = lambda pid: {}
+        mod.agent_registry_record = lambda tool, pid, env=None: {}
+        mod.read_proc_cwd = lambda pid: project if pid in {102, 103} else "/tmp"
+        mod.read_proc_argv = lambda pid: {
+            101: ["bash"],
+            102: ["nvim", "README.md"],
+            103: ["nvim", "--embed"],
+        }.get(pid, [])
+
+        workdir, restore_argv, agent = mod.terminal_child_state(
+            100, "/tmp", {100: [101], 101: [102], 102: [103]}, {}
+        )
+
+        self.assertEqual(workdir, project)
+        self.assertEqual(restore_argv, ["nvim", "README.md"])
+        self.assertEqual(agent, {})
+
+    def test_legacy_saved_embedded_neovim_is_sanitized_at_launch(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
+                cmd, reason = mod.launch_command({
+                    "class": "Alacritty",
+                    "restoreWorkdir": str(workdir),
+                    "restoreArgv": ["nvim", "--embed", "README.md"],
+                })
+            self.assertEqual(reason, "")
+            self.assertEqual(cmd, [
+                "alacritty", f"--working-directory={workdir}",
+                "-e", "bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l',
+                "omarchy-session-restore", "nvim", "README.md",
+            ])
+
     def test_neovim_restore_argv_is_launched_inside_the_terminal(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as tmp:

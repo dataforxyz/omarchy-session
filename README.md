@@ -230,7 +230,9 @@ Hyprland window.
 When Neovim or Vim is running directly inside Ghostty or Alacritty, the saved
 terminal restore command preserves its argv and working directory. For example,
 `nvim README.md src/main.py` is relaunched with those files in the same project
-directory. This also supports `vim` and `vi`.
+directory. This also supports `vim` and `vi`. If a frontend runs Neovim with
+`--embed`, restoration removes that RPC-backend-only flag so the independently
+relaunched terminal receives a normal interactive editor instead of a blank UI.
 
 This is command-level restoration, not an editor-state snapshot. Neovim session
 state that was not represented by its command line—unsaved buffers, cursor
