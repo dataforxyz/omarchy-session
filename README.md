@@ -264,28 +264,80 @@ are rejected. If no exact mapping exists, Pi, Claude, and Codex open their sessi
 picker; OpenCode opens normally. The tool never silently substitutes a guessed
 conversation.
 
-A wrapper that eventually executes an agent can advertise the command that
-should be used during restore. Export the corresponding variable before `exec`
-so it remains visible in the agent process:
+### Custom agent launchers and shell aliases
+
+The project never assumes a machine-specific alias or wrapper. A normal install
+restores with `pi`, `claude`, `codex`, or `opencode`. If a local wrapper selects
+an account, API gateway, model, permission mode, config directory, or executable
+version, the wrapper must explicitly advertise its own executable name.
+
+A shell alias alone is not enough. For example, an interactive alias such as
+`alias claude=my-claude` expands only while the shell parses the command. If
+`my-claude` later runs `exec claude`, Linux exposes the resulting process as
+`claude`, and restore cannot recover the original alias. Export the appropriate
+marker inside the wrapper, before `exec`, so it remains in the agent process
+environment and can be saved:
+
+| Agent | Wrapper environment variable | Default restore command |
+| --- | --- | --- |
+| Pi | `OMARCHY_SESSION_PI_COMMAND` | `pi` |
+| Claude Code | `OMARCHY_SESSION_CLAUDE_COMMAND` | `claude` |
+| Codex | `OMARCHY_SESSION_CODEX_COMMAND` | `codex` |
+| OpenCode | `OMARCHY_SESSION_OPENCODE_COMMAND` | `opencode` |
+
+Use neutral local wrapper names of your choice. Complete minimal examples:
 
 ```bash
 #!/usr/bin/env bash
+# ~/.local/bin/my-pi
+export OMARCHY_SESSION_PI_COMMAND=my-pi
+# Set any wrapper-specific environment or arguments here.
+exec pi "$@"
+```
+
+```bash
+#!/usr/bin/env bash
+# ~/.local/bin/my-claude
+export OMARCHY_SESSION_CLAUDE_COMMAND=my-claude
+# CLAUDE_CONFIG_DIR, API endpoint, model, and permission flags may be set here.
+exec claude "$@"
+```
+
+```bash
+#!/usr/bin/env bash
+# ~/.local/bin/my-codex
 export OMARCHY_SESSION_CODEX_COMMAND=my-codex
+# CODEX_HOME and provider/model arguments may be set here.
 exec codex "$@"
 ```
 
 ```bash
 #!/usr/bin/env bash
-export OMARCHY_SESSION_CLAUDE_COMMAND=my-claude
-exec claude "$@"
+# ~/.local/bin/my-opencode
+export OMARCHY_SESSION_OPENCODE_COMMAND=my-opencode
+exec opencode "$@"
 ```
 
-Supported variables are `OMARCHY_SESSION_PI_COMMAND`,
-`OMARCHY_SESSION_CLAUDE_COMMAND`, `OMARCHY_SESSION_CODEX_COMMAND`, and
-`OMARCHY_SESSION_OPENCODE_COMMAND`. The advertised value must be a simple
-executable name available on `PATH`. Codex wrappers that set `CODEX_HOME` are
-also supported; session lookup follows that home instead of assuming
-`~/.codex`.
+Make the wrapper executable, put it on `PATH`, and optionally point an
+interactive shell alias at it:
+
+```bash
+chmod +x ~/.local/bin/my-claude
+alias claude=my-claude
+```
+
+The advertised value must be a simple executable name, not a path or a command
+with arguments, and it must resolve on `PATH` both when saving and restoring.
+Arguments and environment setup belong inside the wrapper. The marker affects
+only which launcher is replayed; exact conversation matching still comes from
+the session sources listed above. Codex wrappers that set `CODEX_HOME` are also
+supported, and session lookup follows that home instead of assuming `~/.codex`.
+Legacy `CLAUDE_LAUNCHER` and `CODEX_LAUNCHER` markers remain accepted, but new
+wrappers should use the `OMARCHY_SESSION_*_COMMAND` names shown above.
+
+No personal wrapper name, forced model, permission mode, provider, or config path
+belongs in this repository. Those choices remain in each user's local wrapper;
+the repository only provides this generic opt-in contract.
 
 ## Dry-run and verification
 
