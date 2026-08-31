@@ -246,6 +246,7 @@ Direct sessions are resumed using their standard commands when local session
 metadata is available:
 
 - Pi: `pi --session <path>`
+- rpi (the Rust Pi wrapper): `rpi --session <path>` or its session picker
 - Claude Code: `claude --resume <id>`
 - Codex: `codex resume <id>`
 - OpenCode: its saved `ses_*` identifier when supported
@@ -267,8 +268,11 @@ conversation.
 ### Custom agent launchers and shell aliases
 
 The project never assumes a machine-specific alias or wrapper. A normal install
-restores with `pi`, `claude`, `codex`, or `opencode`. If a local wrapper selects
-an account, API gateway, model, permission mode, config directory, or executable
+restores with Pi's private launcher (`~/.pi/agent/bin/pi`) when that executable
+exists, avoiding a conflicting system-wide `pi` selected by the graphical
+session's PATH; otherwise it restores with `pi`. Claude, Codex, and OpenCode
+restore with `claude`, `codex`, and `opencode`. If a local wrapper selects an
+account, API gateway, model, permission mode, config directory, or executable
 version, the wrapper must explicitly advertise its own executable name.
 
 A shell alias alone is not enough. For example, an interactive alias such as
