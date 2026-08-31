@@ -27,6 +27,8 @@ LATEST_AUTOSAVE = AUTOSAVE_DIR / "latest.json"
 PROFILE_DIR = STATE_DIR / "profiles"
 AUTOSAVE_KEEP = 48
 PI_SESSION_ROOT = Path.home() / ".pi/agent/sessions"
+PI_PRIVATE_LAUNCHER = PI_SESSION_ROOT.parent / "bin" / "pi"
+RPI_AGENT_DIR = Path.home() / ".rpi/agent"
 CLAUDE_PROJECT_ROOT = Path.home() / ".claude/projects"
 CODEX_SESSION_ROOT = Path.home() / ".codex/sessions"
 OPENCODE_DB = Path.home() / ".local/share/opencode/opencode.db"
@@ -369,7 +371,41 @@ def restore_launcher_from_env(env: dict[str, str], keys: tuple[str, ...], defaul
 
 
 def pi_command_from_env(env: dict[str, str]) -> str:
-    return restore_launcher_from_env(env, ("OMARCHY_SESSION_PI_COMMAND",), "pi")
+    """Return the Pi launcher without letting a GUI PATH select another ``pi``.
+
+    Pi keeps its own launcher at ``~/.pi/agent/bin/pi``.  It is normally first
+    on an interactive Pi shell's PATH, but desktop services (and therefore
+    Hyprland ``exec`` restores) can have an older PATH where an unrelated Rust
+    ``pi`` wins.  Prefer an explicitly advertised wrapper, then the private
+    Pi launcher when it exists; retain bare ``pi`` for installations without
+    that launcher.
+    """
+    command = restore_launcher_from_env(env, ("OMARCHY_SESSION_PI_COMMAND",), "")
+    if command:
+        return command
+    if PI_PRIVATE_LAUNCHER.is_file() and os.access(PI_PRIVATE_LAUNCHER, os.X_OK):
+        return str(PI_PRIVATE_LAUNCHER)
+    return "pi"
+
+
+def is_rpi_process(env: dict[str, str]) -> bool:
+    """Identify the native Rust Pi wrapper after it execs its ``pi`` binary."""
+    agent_dir = (env.get("PI_CODING_AGENT_DIR") or "").strip()
+    if not agent_dir:
+        return False
+    try:
+        return Path(agent_dir).expanduser().resolve() == RPI_AGENT_DIR.resolve()
+    except OSError:
+        return False
+
+
+def rpi_command_from_env(env: dict[str, str]) -> str:
+    return restore_launcher_from_env(env, ("OMARCHY_SESSION_RPI_COMMAND",), "rpi")
+
+
+def explicit_rpi_session_from_argv(argv: list[str]) -> str:
+    session_arg = option_value(command_tail(argv, "pi"), {"--session", "--session-id"})
+    return session_arg if session_arg and Path(session_arg).is_file() else ""
 
 
 def claude_command_from_env(env: dict[str, str]) -> str:
@@ -560,8 +596,26 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
         exe = Path(argv[0]).name if argv else ""
         if argv_invokes_pi(argv):
             env = read_proc_environ(child_pid)
-            command = pi_command_from_env(env)
             pi_args = command_tail(argv, "pi")
+            # rpi's wrapper execs a binary named ``pi``, but its isolated
+            # PI_CODING_AGENT_DIR persists and distinguishes it from Pi. Keep
+            # it on rpi's own session picker rather than sending it to Pi.
+            if is_rpi_process(env):
+                command = rpi_command_from_env(env)
+                if "--no-session" in pi_args:
+                    return cwd, [command], {}
+                explicit_session = explicit_rpi_session_from_argv(argv)
+                if explicit_session:
+                    return cwd, [command, "--session", explicit_session], {
+                        "tool": "rpi", "id": explicit_session, "path": explicit_session,
+                        "command": command, "match": "argv-session",
+                    }
+                return cwd, [command, "--resume"], {
+                    "tool": "rpi", "id": "picker", "command": command,
+                    "match": "picker-fallback",
+                }
+
+            command = pi_command_from_env(env)
             if "--no-session" in pi_args:
                 return cwd, [command], {}
             explicit_session = explicit_pi_session_from_argv(argv, cwd)
@@ -2102,12 +2156,26 @@ def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str
 
 def terminal_restore_argv(win: dict) -> list[str]:
     restore_argv = safe_terminal_restore_argv(win.get("restoreArgv") or [])
+    agent = win.get("agentSession") or {}
     if restore_argv:
+        # Old saves recorded a bare ``pi`` in restoreArgv.  Do not replay that
+        # name through Hyprland's possibly different PATH when the window is a
+        # known Pi session; preserve any session flags and use its saved wrapper
+        # (or the canonical private launcher for older records).
+        if agent.get("tool") == "pi" and Path(restore_argv[0]).name == "pi":
+            command = agent.get("command") or ""
+            if not command or command == "pi":
+                command = pi_command_from_env({})
+            return [command, *restore_argv[1:]]
         return restore_argv
 
-    agent = win.get("agentSession") or {}
     if agent.get("tool") == "pi" and agent.get("path"):
-        return [agent.get("command") or "pi", "--session", agent.get("path")]
+        command = agent.get("command") or ""
+        return [command if command and command != "pi" else pi_command_from_env({}), "--session", agent.get("path")]
+    if agent.get("tool") == "rpi":
+        command = agent.get("command") or rpi_command_from_env({})
+        session = agent.get("path") or ""
+        return [command, "--session", session] if session else [command, "--resume"]
     if agent.get("tool") == "claude" and agent.get("command"):
         command = agent.get("command")
         session = agent.get("id") or ""
@@ -2126,7 +2194,7 @@ def terminal_restore_argv(win: dict) -> list[str]:
     # agent in the saved cwd rather than dropping the user into an empty shell.
     title = (win.get("title") or "").strip().lower()
     if title.startswith("pi - "):
-        return ["pi", "--resume"]
+        return [pi_command_from_env({}), "--resume"]
     if title.startswith("claude"):
         return ["claude", "--resume"]
     if title.startswith("codex"):

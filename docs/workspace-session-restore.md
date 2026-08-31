@@ -216,8 +216,13 @@ Terminal restore behavior is best effort:
   a blank terminal. Command-level restoration does not independently capture unsaved
   buffers, cursor positions, splits, tabs, or plugin state; use Neovim session
   or persistence tooling when that state must survive;
-- direct `pi` sessions restore with `pi --session <jsonl>` when matching Pi
-  session files can be found;
+- direct `pi` sessions restore with `~/.pi/agent/bin/pi --session <jsonl>`
+  when that private launcher exists, otherwise `pi --session <jsonl>`. This
+  prevents a graphical session PATH from choosing an unrelated `pi` executable;
+- native Rust Pi (`rpi`) is identified by its isolated
+  `PI_CODING_AGENT_DIR=~/.rpi/agent` environment after its wrapper execs. It
+  restores with `rpi` and its own session picker, never the JavaScript Pi
+  launcher;
 - direct or wrapped Claude sessions restore with `claude --resume <session-id>`.
   A wrapper can export `OMARCHY_SESSION_CLAUDE_COMMAND` with its executable name
   so restore uses that wrapper instead of bare `claude`;

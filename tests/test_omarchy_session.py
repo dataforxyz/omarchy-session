@@ -683,6 +683,7 @@ class PiSessionDetectionTests(unittest.TestCase):
 
             mod.read_proc_cwd = fake_cwd
             mod.read_proc_argv = fake_argv
+            mod.PI_PRIVATE_LAUNCHER = Path("/nonexistent/pi")
 
             workdir, restore_argv, agent = mod.terminal_child_state(100, str(cwd), {100: [101], 101: [102]}, {})
 
@@ -698,12 +699,28 @@ class PiSessionDetectionTests(unittest.TestCase):
         mod.read_proc_argv = lambda pid: ["pi", "--continue"]
         mod.read_proc_environ = lambda pid: {}
         mod.agent_registry_record = lambda tool, pid, env=None: {}
+        mod.PI_PRIVATE_LAUNCHER = Path("/nonexistent/pi")
 
         workdir, restore_argv, agent = mod.terminal_child_state(100, cwd, {100: [101]}, {})
 
         self.assertEqual(workdir, cwd)
         self.assertEqual(restore_argv, ["pi", "--resume"])
         self.assertEqual(agent["id"], "picker")
+        self.assertEqual(agent["match"], "picker-fallback")
+
+    def test_rpi_is_distinguished_from_pi_after_its_wrapper_execs(self):
+        mod = load_module()
+        cwd = "/tmp/rpi-project"
+        mod.read_proc_cwd = lambda pid: cwd
+        mod.read_proc_argv = lambda pid: ["pi"]
+        mod.read_proc_environ = lambda pid: {"PI_CODING_AGENT_DIR": str(mod.RPI_AGENT_DIR)}
+        mod.agent_registry_record = lambda tool, pid, env=None: {}
+        mod.PI_PRIVATE_LAUNCHER = Path("/private/pi")
+
+        _, restore_argv, agent = mod.terminal_child_state(100, cwd, {100: [101]}, {})
+
+        self.assertEqual(restore_argv, ["rpi", "--resume"])
+        self.assertEqual(agent["tool"], "rpi")
         self.assertEqual(agent["match"], "picker-fallback")
 
     def test_pi_continue_flag_must_follow_pi_arg(self):
@@ -720,6 +737,7 @@ class PiSessionDetectionTests(unittest.TestCase):
         mod.read_proc_argv = lambda pid: ["pi"]
         mod.read_proc_environ = lambda pid: {}
         mod.agent_registry_record = lambda tool, pid, env=None: {}
+        mod.PI_PRIVATE_LAUNCHER = Path("/nonexistent/pi")
 
         _, restore_argv, agent = mod.terminal_child_state(100, cwd, {100: [101]}, {})
 
@@ -767,6 +785,7 @@ class AgentSessionMatchingTests(unittest.TestCase):
                 ("opencode", 301): {"tool": "opencode", "pid": 301, "sessionId": "ses_exact", "cwd": cwd},
             }
             mod.agent_registry_record = lambda tool, pid, env=None: records.get((tool, pid), {})
+            mod.PI_PRIVATE_LAUNCHER = Path("/nonexistent/pi")
 
             pi_result = mod.terminal_child_state(1, cwd, {1: [101]}, {})
             claude_result = mod.terminal_child_state(2, cwd, {2: [201]}, {})
@@ -821,6 +840,7 @@ class AgentSessionMatchingTests(unittest.TestCase):
         mod.read_proc_environ = lambda pid: {}
         mod.agent_registry_record = lambda tool, pid, env=None: {}
         mod.codex_session_from_process_logs = lambda pid, seen_cwd, env: ""
+        mod.PI_PRIVATE_LAUNCHER = Path("/nonexistent/pi")
 
         expectations = [
             (["pi"], ["pi", "--resume"], "picker-fallback"),
@@ -1232,6 +1252,30 @@ class RestoreCommandTests(unittest.TestCase):
             ["my-claude", "--resume", "abc-123"],
         )
 
+    def test_pi_private_launcher_prevents_gui_path_collision_and_upgrades_old_saves(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = Path(tmp) / "pi"
+            launcher.write_text("#!/bin/sh\n")
+            launcher.chmod(0o700)
+            mod.PI_PRIVATE_LAUNCHER = launcher
+
+            self.assertEqual(mod.pi_command_from_env({}), str(launcher))
+            with mock.patch.object(
+                mod.shutil, "which", lambda command: "/usr/bin/my-pi" if command == "my-pi" else None
+            ):
+                self.assertEqual(
+                    mod.pi_command_from_env({"OMARCHY_SESSION_PI_COMMAND": "my-pi"}),
+                    "my-pi",
+                )
+            self.assertEqual(
+                mod.terminal_restore_argv({
+                    "restoreArgv": ["pi", "--session", "/tmp/saved.jsonl"],
+                    "agentSession": {"tool": "pi", "command": "pi"},
+                }),
+                [str(launcher), "--session", "/tmp/saved.jsonl"],
+            )
+
     def test_legacy_alacritty_claude_title_reopens_claude(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -1252,6 +1296,7 @@ class RestoreCommandTests(unittest.TestCase):
 
     def test_legacy_alacritty_pi_title_opens_picker_without_guessing(self):
         mod = load_module()
+        mod.PI_PRIVATE_LAUNCHER = Path("/nonexistent/pi")
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
             win = {
