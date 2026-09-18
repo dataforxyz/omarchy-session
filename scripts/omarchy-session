@@ -30,7 +30,9 @@ PI_SESSION_ROOT = Path.home() / ".pi/agent/sessions"
 PI_PRIVATE_LAUNCHER = PI_SESSION_ROOT.parent / "bin" / "pi"
 RPI_AGENT_DIR = Path.home() / ".rpi/agent"
 CLAUDE_PROJECT_ROOT = Path.home() / ".claude/projects"
-CODEX_SESSION_ROOT = Path.home() / ".codex/sessions"
+CODEX_HOME_DEFAULT = Path.home() / ".codex"
+CODEX_SESSION_ROOT = CODEX_HOME_DEFAULT / "sessions"
+CODEX_STATE_DB_RE = re.compile(r"^state_(\d+)\.sqlite$")
 OPENCODE_DB = Path.home() / ".local/share/opencode/opencode.db"
 AGENT_REGISTRY_DIRNAME = "omarchy-session/agents"
 PI_REGISTRY_EXTENSION = Path.home() / ".pi/agent/extensions/omarchy-session-registry.ts"
@@ -467,6 +469,72 @@ def codex_session_from_process_logs(pid: int, cwd: str, env: dict[str, str]) -> 
     return next((thread_id for (thread_id,) in rows if thread_id in top_level), "")
 
 
+def codex_state_db_from_env(env: dict[str, str]) -> Path | None:
+    """Newest `state_<n>.sqlite`, the app-server's index of known threads."""
+    codex_home = Path(env.get("CODEX_HOME") or CODEX_HOME_DEFAULT).expanduser()
+    best: Path | None = None
+    best_version = -1
+    try:
+        entries = list(codex_home.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        found = CODEX_STATE_DB_RE.match(entry.name)
+        if found and int(found.group(1)) > best_version:
+            best, best_version = entry, int(found.group(1))
+    return best
+
+
+def codex_title_candidates(title: str) -> list[str]:
+    """Terminals render Codex titles as "<thread name> | <directory>"."""
+    title = title.strip()
+    candidates = [title]
+    head = title.rpartition(" | ")[0].strip()
+    if head and head not in candidates:
+        candidates.append(head)
+    return [candidate for candidate in candidates if candidate]
+
+
+def codex_session_from_thread_index(title: str, cwd: str, env: dict[str, str]) -> tuple[str, str]:
+    """Recover a thread id from the window title via Codex's thread index.
+
+    Codex runs as a thin client against a shared app-server daemon, so a
+    window's own pid owns no thread and the pid/thread log mapping stays
+    empty. The daemon names the threads it has loaded, and that name is what
+    the terminal shows, so an unambiguous name is a reliable identifier.
+    """
+    db_path = codex_state_db_from_env(env)
+    if not title or db_path is None or not db_path.exists():
+        return "", ""
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        columns = {row[1] for row in conn.execute("pragma table_info(threads)")}
+        if "name" not in columns:
+            return "", ""
+        clauses = ""
+        if "archived" in columns:
+            clauses += " and archived = 0"
+        if "thread_source" in columns:
+            clauses += " and (thread_source is null or thread_source <> 'subagent')"
+        # Prefer a name that also matches the working directory; fall back to a
+        # globally unique name, since a terminal may have been cd'd elsewhere.
+        for scope, match in ((" and cwd = ?", "thread-index-cwd"), ("", "thread-index")):
+            for name in codex_title_candidates(title):
+                params = [name, cwd] if scope else [name]
+                rows = conn.execute(
+                    f"select id from threads where name = ?{scope}{clauses}", params
+                ).fetchall()
+                if len(rows) == 1:
+                    return str(rows[0][0]), match
+    except Exception:
+        return "", ""
+    finally:
+        if conn is not None:
+            conn.close()
+    return "", ""
+
+
 def codex_session_metadata(path: Path) -> tuple[str, str, float] | None:
     try:
         with path.open(errors="ignore") as handle:
@@ -539,7 +607,7 @@ def safe_terminal_restore_argv(argv: list[str]) -> list[str]:
     return argv
 
 
-def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]], used_sessions: dict[str, set[str]]) -> tuple[str, list[str], dict]:
+def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]], used_sessions: dict[str, set[str]], title: str = "") -> tuple[str, list[str], dict]:
     home = str(Path.home())
     best = (0, fallback)
     restore_argv: list[str] = []
@@ -661,6 +729,8 @@ def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]]
             else:
                 session = codex_session_from_process_logs(child_pid, cwd, env)
                 match = "pid-log"
+                if not session:
+                    session, match = codex_session_from_thread_index(title, cwd, env)
             if session:
                 used_sessions.setdefault(used_key, set()).add(session)
                 return cwd, [command, "resume", session], {
@@ -779,7 +849,9 @@ def collect_windows() -> list[dict]:
         restore_argv: list[str] = []
         restore_session: dict = {}
         if cls.lower() in TERMINAL_CLASSES:
-            workdir, restore_argv, restore_session = terminal_child_state(pid, workdir, proc_children, used_sessions)
+            workdir, restore_argv, restore_session = terminal_child_state(
+                pid, workdir, proc_children, used_sessions, c.get("title") or ""
+            )
         ws = c.get("workspace") or {}
         grouped = c.get("grouped") or []
         group_index = grouped.index(c.get("address")) if c.get("address") in grouped else 0

@@ -833,6 +833,97 @@ class AgentSessionMatchingTests(unittest.TestCase):
             env = {"CODEX_HOME": str(home)}
             self.assertEqual(mod.codex_session_from_process_logs(123, cwd, env), "main-thread")
 
+    def _codex_state_home(self, tmp, rows, version=5):
+        home = Path(tmp) / ".codex"
+        home.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(home / f"state_{version}.sqlite")
+        try:
+            conn.execute(
+                "create table threads (id text primary key, cwd text, name text,"
+                " archived integer default 0, thread_source text)"
+            )
+            conn.executemany(
+                "insert into threads (id, cwd, name, archived, thread_source)"
+                " values (?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return home
+
+    def test_codex_thread_index_maps_terminal_title_to_thread(self):
+        mod = load_module()
+        cwd = "/tmp/project"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._codex_state_home(tmp, [
+                ("thread-a", cwd, "Add inline subtitle editing", 0, "cli"),
+                ("thread-b", cwd, "github long times", 0, "user"),
+            ])
+            env = {"CODEX_HOME": str(home)}
+            self.assertEqual(
+                mod.codex_session_from_thread_index("Add inline subtitle editing | project", cwd, env),
+                ("thread-a", "thread-index-cwd"),
+            )
+
+    def test_codex_thread_index_falls_back_to_unique_name_across_cwds(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            # The terminal was cd'd away from where the thread was created.
+            home = self._codex_state_home(tmp, [
+                ("thread-a", "/home/user", "Find watcher system", 0, "cli"),
+            ])
+            env = {"CODEX_HOME": str(home)}
+            self.assertEqual(
+                mod.codex_session_from_thread_index("Find watcher system | user", "/tmp/elsewhere", env),
+                ("thread-a", "thread-index"),
+            )
+
+    def test_codex_thread_index_refuses_ambiguous_or_excluded_threads(self):
+        mod = load_module()
+        cwd = "/tmp/project"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._codex_state_home(tmp, [
+                ("thread-a", cwd, "shared name", 0, "cli"),
+                ("thread-b", cwd, "shared name", 0, "cli"),
+                ("thread-c", cwd, "archived thread", 1, "cli"),
+                ("thread-d", cwd, "spawned thread", 0, "subagent"),
+            ])
+            env = {"CODEX_HOME": str(home)}
+            for title in ("shared name", "archived thread", "spawned thread", "unknown"):
+                self.assertEqual(
+                    mod.codex_session_from_thread_index(title, cwd, env), ("", ""), title
+                )
+
+    def test_codex_state_db_prefers_newest_version(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._codex_state_home(tmp, [], version=5)
+            (home / "state_12.sqlite").write_text("")
+            (home / "state_notanumber.sqlite").write_text("")
+            self.assertEqual(
+                mod.codex_state_db_from_env({"CODEX_HOME": str(home)}),
+                home / "state_12.sqlite",
+            )
+            self.assertIsNone(mod.codex_state_db_from_env({"CODEX_HOME": str(Path(tmp) / "missing")}))
+
+    def test_codex_falls_back_to_thread_index_when_pid_log_is_empty(self):
+        mod = load_module()
+        cwd = "/tmp/project"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._codex_state_home(tmp, [("thread-a", cwd, "my work", 0, "cli")])
+            mod.read_proc_cwd = lambda pid: cwd
+            mod.read_proc_environ = lambda pid: {"CODEX_HOME": str(home)}
+            mod.read_proc_argv = lambda pid: ["codex"]
+            mod.agent_registry_record = lambda tool, pid, env=None: {}
+            # The app-server daemon owns the thread, so the pid mapping is empty.
+            mod.codex_session_from_process_logs = lambda pid, seen_cwd, env: ""
+
+            workdir, restore_argv, agent = mod.terminal_child_state(1, cwd, {1: [101]}, {}, "my work | project")
+            self.assertEqual(restore_argv, ["codex", "resume", "thread-a"])
+            self.assertEqual(agent["match"], "thread-index-cwd")
+            self.assertEqual(agent["id"], "thread-a")
+
     def test_missing_exact_mapping_never_guesses_from_cwd(self):
         mod = load_module()
         cwd = "/tmp/project"
