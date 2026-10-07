@@ -412,6 +412,7 @@ class DryRunTests(unittest.TestCase):
         calls = []
         mod.find_new_window = lambda target, before_addresses: {"address": "0xnew"}
         mod.hypr = lambda *args, **kwargs: calls.append(args) or True
+        mod.hypr_dispatch = lambda lua_expr, *args, **kwargs: calls.append(("dispatch", *args)) or True
 
         address, failures = mod.apply_saved_state(target, set())
 
@@ -1405,6 +1406,78 @@ class RestoreCommandTests(unittest.TestCase):
                     "pi", "--resume",
                 ])
 
+    def test_omarchy_agent_class_restores_like_foot_terminal(self):
+        mod = load_module()
+        self.assertIn("org.omarchy.agent", mod.TERMINAL_CLASSES)
+        self.assertIn("foot", mod.TERMINAL_CLASSES)
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            # Old saves without agentSession recover the command from procArgv.
+            old = {
+                "class": "org.omarchy.agent",
+                "title": "OC | Turning bluetooth on",
+                "procArgv": ["foot", "--app-id=org.omarchy.agent", "-e", "opencode", "--auto"],
+                "procCmdline": "foot --app-id=org.omarchy.agent -e opencode --auto",
+                "restoreWorkdir": str(workdir),
+                "restoreArgv": [],
+                "agentSession": {},
+            }
+            self.assertEqual(mod.terminal_restore_argv(old), ["opencode", "--auto"])
+            with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
+                cmd, reason = mod.launch_command(old)
+                self.assertEqual(reason, "")
+                self.assertEqual(cmd, [
+                    "foot", "--app-id=org.omarchy.agent", f"--working-directory={workdir}",
+                    "bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l', "omarchy-session-restore",
+                    "opencode", "--auto",
+                ])
+            # New saves with an exact opencode session resume it in scratchpad.
+            new = {
+                "class": "org.omarchy.agent",
+                "title": "OC | Turning bluetooth on",
+                "workspace": {"id": -98, "name": "special:scratchpad"},
+                "restoreWorkdir": str(workdir),
+                "restoreArgv": ["sh", "-lc", "opencode --session ses_123 || opencode"],
+                "agentSession": {"tool": "opencode", "id": "ses_123", "command": "opencode"},
+            }
+            with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
+                cmd, reason = mod.launch_command(new)
+                self.assertEqual(reason, "")
+                self.assertIn("--app-id=org.omarchy.agent", cmd)
+                self.assertEqual(mod.workspace_spec(new), "special:scratchpad")
+
+    def test_ephemeral_terminal_workdir_falls_back_to_home(self):
+        mod = load_module()
+        home = str(Path.home())
+        missing = "/nonexistent-omarchy-session-tmp-приклад"
+        self.assertFalse(Path(missing).exists())
+        target = {
+            "class": "foot",
+            "title": "bruno@omarchy:/tmp/opencode/omarchy-session",
+            "workspace": {"id": -98, "name": "special:scratchpad"},
+            "restoreWorkdir": missing,
+            "restoreArgv": [],
+        }
+        # Launch is explicit about HOME so the shell does not inherit a
+        # random spawner cwd.
+        with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
+            cmd, reason = mod.launch_command(target)
+            self.assertEqual(reason, "")
+            self.assertIn(f"--working-directory={home}", cmd)
+        # Detection matches the HOME fallback instead of scoring 0, so the
+        # window is claimed and moved instead of left as a stray duplicate.
+        candidate = {
+            "class": "foot",
+            "title": "bruno@omarchy:~",
+            "workspace": {"id": 5, "name": "5"},
+            "restoreWorkdir": home,
+        }
+        self.assertTrue(mod.compatible_current_window(target, candidate))
+        self.assertGreater(mod.candidate_match_score(target, candidate), 0)
+        elsewhere = dict(candidate, restoreWorkdir="/var/tmp")
+        self.assertFalse(mod.compatible_current_window(target, elsewhere))
+        self.assertEqual(mod.candidate_match_score(target, elsewhere), 0)
+
     def test_chromium_webapp_recovers_single_string_argv_and_class_url(self):
         mod = load_module()
         win = {
@@ -1688,13 +1761,53 @@ class GroupRestoreTests(unittest.TestCase):
                 return True
             return True
 
-        return member_to_group, window_group, hypr
+        def hypr_dispatch(lua_expr, *legacy, **kwargs):
+            # Production code prefers the Hyprland 0.55+ Lua dispatcher and
+            # passes the legacy dispatcher as fallback args. The simulator
+            # understands both shapes.
+            if legacy:
+                return hypr("dispatch", *legacy, **kwargs)
+            expr = lua_expr or ""
+            if "hl.dsp.focus" in expr:
+                addr = expr.split("address:", 1)[1].split('"', 1)[0] if "address:" in expr else ""
+                if fail_once.get(addr):
+                    fail_once[addr] -= 1
+                    return False
+                focused["addr"] = addr
+                return True
+            if "hl.dsp.group.toggle()" in expr:
+                a = focused["addr"]
+                if a and a not in member_to_group:
+                    member_to_group[a] = {a}
+                return True
+            if "into_group" in expr:
+                a = focused["addr"]
+                if a is not None:
+                    for grp in {id(g): g for g in member_to_group.values()}.values():
+                        if a not in grp:
+                            grp.add(a)
+                            member_to_group[a] = grp
+                            break
+                return True
+            return True
+
+        def hypr_focus_window(address, retries=2):
+            addr = address.split("address:", 1)[1] if "address:" in address else address
+            if fail_once.get(addr):
+                fail_once[addr] -= 1
+                return False
+            focused["addr"] = addr
+            return True
+
+        return member_to_group, window_group, hypr, hypr_dispatch, hypr_focus_window
 
     def test_group_addresses_groups_all_members(self):
         mod = load_module()
-        member_to_group, window_group, hypr = self._simulator(mod)
+        member_to_group, window_group, hypr, hypr_dispatch, hypr_focus_window = self._simulator(mod)
         with mock.patch.object(mod, "window_group", window_group), \
                 mock.patch.object(mod, "hypr", hypr), \
+                mock.patch.object(mod, "hypr_dispatch", hypr_dispatch), \
+                mock.patch.object(mod, "hypr_focus_window", hypr_focus_window), \
                 mock.patch.object(mod.time, "sleep", lambda *_: None):
             self.assertTrue(mod.group_addresses(["0x1", "0x2", "0x3"]))
         self.assertEqual(set(member_to_group["0x1"]), {"0x1", "0x2", "0x3"})
@@ -1703,9 +1816,11 @@ class GroupRestoreTests(unittest.TestCase):
         mod = load_module()
         # The middle window's first focus is dropped; it must still join on retry
         # instead of aborting the whole group (the old code returned False here).
-        member_to_group, window_group, hypr = self._simulator(mod, fail_once={"0x2": 1})
+        member_to_group, window_group, hypr, hypr_dispatch, hypr_focus_window = self._simulator(mod, fail_once={"0x2": 1})
         with mock.patch.object(mod, "window_group", window_group), \
                 mock.patch.object(mod, "hypr", hypr), \
+                mock.patch.object(mod, "hypr_dispatch", hypr_dispatch), \
+                mock.patch.object(mod, "hypr_focus_window", hypr_focus_window), \
                 mock.patch.object(mod.time, "sleep", lambda *_: None):
             self.assertTrue(mod.group_addresses(["0x1", "0x2", "0x3"]))
         self.assertEqual(set(member_to_group["0x1"]), {"0x1", "0x2", "0x3"})

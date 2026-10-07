@@ -42,7 +42,7 @@ MAKE_RESTORE_TARGETS = {"ssh", "pi", "claude", "codex", "opencode"}
 DIRECT_RESTORE_COMMANDS = {"ssh", "tmux", "nvim", "vim", "vi", "claude", "codex", "opencode"}
 EXCLUDED_CLASSES = {"zenity", "pinentry", "org.gnome.polkit", "xdg-desktop-portal"}
 CHROMIUM_BROWSER_CLASSES = {
-    "chromium", "chromium-browser", "brave-browser", "brave",
+    "chromium", "chromium-browser", "brave-browser", "brave", "brave-origin",
     "google-chrome", "google-chrome-stable",
 }
 FIREFOX_BROWSER_CLASSES = {
@@ -55,12 +55,12 @@ SINGLETON_CLASSES = {
     "slack", "discord", "signal", "signal-desktop", "obsidian", "thunderbird", "keepassxc",
     "org.keepassxc.keepassxc", "telegram-desktop", "org.telegram.desktop",
 }
-TERMINAL_CLASSES = {"com.mitchellh.ghostty", "ghostty", "alacritty"}
+TERMINAL_CLASSES = {"com.mitchellh.ghostty", "ghostty", "alacritty", "foot", "org.omarchy.agent"}
 REQUIRED_COMMANDS = ("hyprctl",)
 VERBOSE = False
 
 OPTIONAL_COMMAND_GROUPS = {
-    "terminal restore": ("ghostty", "alacritty"),
+    "terminal restore": ("ghostty", "alacritty", "foot"),
     "notifications/session supervision": ("notify-send", "uwsm"),
     "pick menu": ("walker", "wofi", "fuzzel", "rofi"),
     "web apps": ("omarchy-launch-webapp",),
@@ -1429,7 +1429,7 @@ def browser_profile_summary(win: dict) -> str:
 
 
 def chrome_app_url_from_class(cls: str) -> str:
-    match = re.match(r"^chrome-([^_]+)__-", cls.lower())
+    match = re.match(r"^(?:chrome|brave)-([^_]+)__-", cls.lower())
     if not match:
         return ""
     host = match.group(1).strip("-.")
@@ -1446,7 +1446,7 @@ def url_host(url: str) -> str:
 
 
 def chrome_app_flags_from_class(cls: str) -> list[str]:
-    match = re.match(r"^chrome-[^_]+__-(.+)$", cls)
+    match = re.match(r"^(?:chrome|brave)-[^_]+__-(.+)$", cls)
     if not match:
         return []
     profile = match.group(1).strip()
@@ -1586,11 +1586,65 @@ def hypr(*args: str, retries: int = 1, delay: float = 0.08) -> bool:
     return False
 
 
+def _lua_str(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+
+def hypr_dispatch(lua_expr: str, *legacy_args: str, retries: int = 1, delay: float = 0.08) -> bool:
+    # Hyprland 0.55+ with Lua config rejects legacy `hyprctl dispatch <name> <arg>`
+    # syntax (it is wrapped as `hl.dispatch(<name> ...)` and fails to parse).
+    # Try the Lua dispatcher first, fall back to legacy for older Hyprland.
+    if hypr("dispatch", lua_expr, retries=retries, delay=delay):
+        return True
+    if legacy_args:
+        return hypr("dispatch", *legacy_args, retries=retries, delay=delay)
+    return False
+
+
+def hypr_focus_window(address: str, retries: int = 2) -> bool:
+    addr = address if address.startswith("address:") else f"address:{address}"
+    return hypr_dispatch(
+        f"hl.dsp.focus({{ window = {_lua_str(addr)} }})",
+        "focuswindow", addr,
+        retries=retries,
+    )
+
+
+def hypr_focus_workspace(ws: str, retries: int = 2) -> bool:
+    return hypr_dispatch(
+        f"hl.dsp.focus({{ workspace = {_lua_str(ws)} }})",
+        "workspace", ws,
+        retries=retries,
+    )
+
+
+def hypr_move_to_workspace(ws: str, address: str, retries: int = 2) -> bool:
+    addr = address if address.startswith("address:") else f"address:{address}"
+    return hypr_dispatch(
+        f"hl.dsp.window.move({{ workspace = {_lua_str(ws)}, window = {_lua_str(addr)}, follow = false }})",
+        "movetoworkspacesilent", f"{ws},{addr}",
+        retries=retries,
+    )
+
+
+def hypr_move_workspace_to_monitor(ws: str, monitor: str, retries: int = 2) -> bool:
+    return hypr_dispatch(
+        f"hl.dsp.workspace.move({{ workspace = {_lua_str(ws)}, monitor = {_lua_str(monitor)} }})",
+        "moveworkspacetomonitor", f"{ws} {monitor}",
+        retries=retries,
+    )
+
+
 def hypr_exec_on_workspace(cmd: list[str], ws: str) -> bool:
     # Hyprland exec rules launch on the target workspace without switching your
     # current focus there. This avoids restore yanking you around.
     rule = f"[workspace {ws} silent] " if ws else ""
-    return hypr("dispatch", "exec", rule + shlex.join(uwsm_cmd(cmd)), retries=2)
+    full_cmd = rule + shlex.join(uwsm_cmd(cmd))
+    return hypr_dispatch(
+        f"hl.dsp.exec_cmd({_lua_str(full_cmd)})",
+        "exec", full_cmd,
+        retries=2,
+    )
 
 
 def monitor_target(win: dict) -> str:
@@ -1633,11 +1687,29 @@ def restore_workspace_monitors(targets: list[dict]) -> tuple[int, int]:
     moved = 0
     failed = 0
     for ws, monitor in workspace_monitor_moves(targets):
-        if hypr("dispatch", "moveworkspacetomonitor", f"{ws} {monitor}", retries=2):
+        if hypr_move_workspace_to_monitor(ws, monitor, retries=2):
             moved += 1
         else:
             failed += 1
     return moved, failed
+
+
+def fallback_terminal_workdir(win: dict) -> str:
+    """Where a terminal actually opens when its saved cwd is gone.
+
+    Ephemeral directories (/tmp/..., unplugged mounts, deleted projects) do
+    not survive a reboot, so the launcher falls back to HOME. Detection must
+    compare against that effective directory, not the stale saved path, or
+    the launched window scores 0 and is never claimed/moved (it stays as a
+    stray duplicate on the workspace it opened on).
+    """
+    workdir = win.get("restoreWorkdir") or ""
+    if workdir and Path(workdir).is_dir():
+        return workdir
+    home = str(Path.home())
+    if home and Path(home).is_dir():
+        return home
+    return ""
 
 
 def compatible_current_window(target: dict, candidate: dict) -> bool:
@@ -1663,8 +1735,11 @@ def compatible_current_window(target: dict, candidate: dict) -> bool:
 
     target_workdir = target.get("restoreWorkdir") or ""
     candidate_workdir = candidate.get("restoreWorkdir") or ""
-    if lc_class(target) in TERMINAL_CLASSES and target_workdir and target_workdir == candidate_workdir:
-        return True
+    if lc_class(target) in TERMINAL_CLASSES and target_workdir:
+        if target_workdir == candidate_workdir:
+            return True
+        if not Path(target_workdir).is_dir() and candidate_workdir == fallback_terminal_workdir(target):
+            return True
 
     return is_singleton(target)
 
@@ -1698,8 +1773,11 @@ def candidate_match_score(target: dict, candidate: dict) -> int:
 
     target_workdir = target.get("restoreWorkdir") or ""
     candidate_workdir = candidate.get("restoreWorkdir") or ""
-    if lc_class(target) in TERMINAL_CLASSES and target_workdir and target_workdir == candidate_workdir:
-        score = max(score, 75)
+    if lc_class(target) in TERMINAL_CLASSES and target_workdir:
+        if target_workdir == candidate_workdir:
+            score = max(score, 75)
+        elif not Path(target_workdir).is_dir() and candidate_workdir == fallback_terminal_workdir(target):
+            score = max(score, 55)
 
     if is_singleton(target):
         score = max(score, 60)
@@ -1773,24 +1851,36 @@ def apply_saved_state(target: dict, before_addresses: set[str]) -> tuple[str, in
 
     ws = workspace_spec(target)
     if ws.startswith("special:"):
-        if not hypr("dispatch", "movetoworkspacesilent", f"{ws},address:{address}", retries=2):
+        if not hypr_move_to_workspace(ws, address, retries=2):
             failed_dispatches += 1
         return address, failed_dispatches
 
-    if not hypr("dispatch", "movetoworkspacesilent", f"{ws},address:{address}", retries=2):
+    if not hypr_move_to_workspace(ws, address, retries=2):
         failed_dispatches += 1
 
     # Best-effort: geometry restore is useful mostly for floating windows. Tiled
     # windows are intentionally left to Hyprland's layout. Avoid focuswindow here
     # so restore does not steal focus.
     if target.get("floating"):
-        if not hypr("dispatch", "setfloating", f"address:{address}", retries=2):
+        if not hypr_dispatch(
+            f"hl.dsp.window.float({{ window = {_lua_str(f'address:{address}')}, action = {_lua_str('enable')} }})",
+            "setfloating", f"address:{address}",
+            retries=2,
+        ):
             failed_dispatches += 1
         size = target.get("size") or []
         at = target.get("at") or []
-        if len(size) == 2 and not hypr("dispatch", "resizewindowpixel", f"exact {size[0]} {size[1]},address:{address}", retries=2):
+        if len(size) == 2 and not hypr_dispatch(
+            f"hl.dsp.window.resize({{ window = {_lua_str(f'address:{address}')}, x = {int(size[0])}, y = {int(size[1])} }})",
+            "resizewindowpixel", f"exact {size[0]} {size[1]},address:{address}",
+            retries=2,
+        ):
             failed_dispatches += 1
-        if len(at) == 2 and not hypr("dispatch", "movewindowpixel", f"exact {at[0]} {at[1]},address:{address}", retries=2):
+        if len(at) == 2 and not hypr_dispatch(
+            f"hl.dsp.window.move({{ window = {_lua_str(f'address:{address}')}, x = {int(at[0])}, y = {int(at[1])} }})",
+            "movewindowpixel", f"exact {at[0]} {at[1]},address:{address}",
+            retries=2,
+        ):
             failed_dispatches += 1
     return address, failed_dispatches
 
@@ -1951,9 +2041,9 @@ def ensure_group_head(address: str) -> bool:
     if window_in_group(address):
         return True
     for _ in range(3):
-        if not hypr("dispatch", "focuswindow", f"address:{address}", retries=2):
+        if not hypr_focus_window(address, retries=2):
             return window_in_group(address)
-        hypr("dispatch", "togglegroup", retries=2)
+        hypr_dispatch("hl.dsp.group.toggle()", "togglegroup", retries=2)
         if wait_until(lambda: window_in_group(address), GROUP_HEAD_TIMEOUT):
             return True
     return window_in_group(address)
@@ -1968,11 +2058,15 @@ def move_into_group(head: str, address: str) -> bool:
     """
     if addresses_same_group([head, address]):
         return True
-    if not hypr("dispatch", "focuswindow", f"address:{address}", retries=2):
+    if not hypr_focus_window(address, retries=2):
         return False
     time.sleep(GROUP_SETTLE)
     for direction in ("l", "r", "u", "d"):
-        if not hypr("dispatch", "moveintogroup", direction, retries=1):
+        if not hypr_dispatch(
+            f"hl.dsp.window.move({{ into_group = {_lua_str(direction)} }})",
+            "moveintogroup", direction,
+            retries=1,
+        ):
             continue
         if wait_until(lambda: addresses_same_group([head, address]), GROUP_JOIN_TIMEOUT):
             return True
@@ -2191,7 +2285,7 @@ def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str
                 pass
         if current_address:
             attempted = True
-            if hypr("dispatch", "focuswindow", f"address:{current_address}", retries=2):
+            if hypr_focus_window(current_address, retries=2):
                 return True, attempted
 
         active_key = active.get("restoreKey") or ""
@@ -2201,14 +2295,14 @@ def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str
                     address = win.get("address") or ""
                     if address:
                         attempted = True
-                        if hypr("dispatch", "focuswindow", f"address:{address}", retries=2):
+                        if hypr_focus_window(address, retries=2):
                             return True, attempted
                         break
 
         ws = workspace_from_snapshot(active)
         if ws:
             attempted = True
-            if hypr("dispatch", "workspace", ws, retries=2):
+            if hypr_focus_workspace(ws, retries=2):
                 return True, attempted
 
     # Older session files did not record active focus. Preserve the user's
@@ -2216,12 +2310,12 @@ def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str
     fallback_address = fallback_active.get("address") or ""
     if fallback_address:
         attempted = True
-        if hypr("dispatch", "focuswindow", f"address:{fallback_address}", retries=2):
+        if hypr_focus_window(fallback_address, retries=2):
             return True, attempted
     fallback_ws = workspace_from_snapshot(fallback_active)
     if fallback_ws:
         attempted = True
-        if hypr("dispatch", "workspace", fallback_ws, retries=2):
+        if hypr_focus_workspace(fallback_ws, retries=2):
             return True, attempted
     return False, attempted
 
@@ -2273,6 +2367,32 @@ def terminal_restore_argv(win: dict) -> list[str]:
         return ["codex", "resume"]
     if title.startswith("opencode"):
         return ["opencode"]
+    # org.omarchy.agent windows use titles like "OC | ..." while running
+    # e.g. `foot --app-id=org.omarchy.agent -e opencode --auto`. Recover the
+    # launched command from procArgv so old saves without agentSession still
+    # restore instead of being skipped as unknown.
+    if lc_class(win) == "org.omarchy.agent":
+        for argv_source in (win.get("procArgv") or [],):
+            argv = list(argv_source) if isinstance(argv_source, list) else []
+            if len(argv) == 1 and " " in str(argv[0]):
+                try:
+                    argv = shlex.split(str(argv[0]))
+                except ValueError:
+                    argv = []
+            if "-e" in argv:
+                tail = argv[argv.index("-e") + 1:]
+                if tail:
+                    return safe_terminal_restore_argv(tail)
+        proc_cmd = win.get("procCmdline") or ""
+        if "-e " in proc_cmd:
+            try:
+                tail = shlex.split(proc_cmd.split("-e", 1)[1].strip())
+                if tail:
+                    return safe_terminal_restore_argv(tail)
+            except ValueError:
+                pass
+        if title.startswith("oc |") or title.startswith("oc "):
+            return ["opencode", "--auto"]
     return []
 
 
@@ -2301,21 +2421,40 @@ def launch_command(win: dict) -> tuple[list[str] | None, str]:
     elif cls in {"com.mitchellh.ghostty", "ghostty"}:
         restore_argv = terminal_restore_argv(win)
         cmd = ["ghostty"]
-        if workdir and Path(workdir).is_dir():
-            cmd.append(f"--working-directory={workdir}")
+        launch_dir = fallback_terminal_workdir(win)
+        if launch_dir:
+            cmd.append(f"--working-directory={launch_dir}")
         if restore_argv:
             cmd.extend(["-e", *terminal_exec_argv(restore_argv)])
     elif cls == "alacritty":
         restore_argv = terminal_restore_argv(win)
         cmd = ["alacritty"]
-        if workdir and Path(workdir).is_dir():
-            cmd.append(f"--working-directory={workdir}")
+        launch_dir = fallback_terminal_workdir(win)
+        if launch_dir:
+            cmd.append(f"--working-directory={launch_dir}")
         if restore_argv:
             cmd.extend(["-e", *terminal_exec_argv(restore_argv)])
+    elif cls == "foot":
+        restore_argv = terminal_restore_argv(win)
+        cmd = ["foot"]
+        launch_dir = fallback_terminal_workdir(win)
+        if launch_dir:
+            cmd.append(f"--working-directory={launch_dir}")
+        if restore_argv:
+            cmd.extend(terminal_exec_argv(restore_argv))
+    elif cls == "org.omarchy.agent":
+        restore_argv = terminal_restore_argv(win)
+        if not restore_argv:
+            restore_argv = ["opencode", "--auto"]
+        cmd = ["foot", "--app-id=org.omarchy.agent"]
+        launch_dir = fallback_terminal_workdir(win)
+        if launch_dir:
+            cmd.append(f"--working-directory={launch_dir}")
+        cmd.extend(terminal_exec_argv(restore_argv))
     elif cls in {"chromium", "chromium-browser"}:
         cmd = ["chromium", *browser_profile_args(win)]
-    elif cls in {"brave-browser", "brave"}:
-        cmd = ["brave", *browser_profile_args(win)]
+    elif cls in {"brave-browser", "brave", "brave-origin"}:
+        cmd = [first_available_command(["brave-origin", "brave", "brave-browser"]), *browser_profile_args(win)]
     elif cls in {"google-chrome", "google-chrome-stable"}:
         cmd = ["google-chrome-stable", *browser_profile_args(win)]
     elif cls in {"firefox", "firefoxdeveloperedition"}:
@@ -2340,6 +2479,12 @@ def launch_command(win: dict) -> tuple[list[str] | None, str]:
         cmd = ["keepassxc"]
     elif cls in {"code", "code-url-handler", "visual-studio-code"}:
         cmd = ["code", workdir] if workdir and Path(workdir).is_dir() else ["code"]
+    elif cls == "ohmail":
+        appimage = Path.home() / "Applications/ohmail.AppImage"
+        if appimage.is_file() and os.access(appimage, os.X_OK):
+            cmd = [str(appimage)]
+        elif shutil.which("gtk-launch"):
+            cmd = ["gtk-launch", "ohmail"]
 
     if not cmd:
         return None, f"unknown app class: {win.get('class')} — {win.get('title')}"
@@ -2853,7 +2998,11 @@ def hard_undo() -> None:
         if not address or address not in live_addresses:
             missing += 1
             continue
-        hypr("dispatch", "closewindow", f"address:{address}")
+        addr = address if address.startswith("address:") else f"address:{address}"
+        hypr_dispatch(
+            f"hl.dsp.window.close({{ window = {_lua_str(addr)} }})",
+            "closewindow", addr,
+        )
         closed += 1
         time.sleep(0.1)
     print(f"Hard undo closed {closed} windows from last restore; missing/already closed {missing}")
