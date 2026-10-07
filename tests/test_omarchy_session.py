@@ -1446,6 +1446,38 @@ class RestoreCommandTests(unittest.TestCase):
                 self.assertIn("--app-id=org.omarchy.agent", cmd)
                 self.assertEqual(mod.workspace_spec(new), "special:scratchpad")
 
+    def test_ephemeral_terminal_workdir_falls_back_to_home(self):
+        mod = load_module()
+        home = str(Path.home())
+        missing = "/nonexistent-omarchy-session-tmp-приклад"
+        self.assertFalse(Path(missing).exists())
+        target = {
+            "class": "foot",
+            "title": "bruno@omarchy:/tmp/opencode/omarchy-session",
+            "workspace": {"id": -98, "name": "special:scratchpad"},
+            "restoreWorkdir": missing,
+            "restoreArgv": [],
+        }
+        # Launch is explicit about HOME so the shell does not inherit a
+        # random spawner cwd.
+        with mock.patch.object(mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}"):
+            cmd, reason = mod.launch_command(target)
+            self.assertEqual(reason, "")
+            self.assertIn(f"--working-directory={home}", cmd)
+        # Detection matches the HOME fallback instead of scoring 0, so the
+        # window is claimed and moved instead of left as a stray duplicate.
+        candidate = {
+            "class": "foot",
+            "title": "bruno@omarchy:~",
+            "workspace": {"id": 5, "name": "5"},
+            "restoreWorkdir": home,
+        }
+        self.assertTrue(mod.compatible_current_window(target, candidate))
+        self.assertGreater(mod.candidate_match_score(target, candidate), 0)
+        elsewhere = dict(candidate, restoreWorkdir="/var/tmp")
+        self.assertFalse(mod.compatible_current_window(target, elsewhere))
+        self.assertEqual(mod.candidate_match_score(target, elsewhere), 0)
+
     def test_chromium_webapp_recovers_single_string_argv_and_class_url(self):
         mod = load_module()
         win = {

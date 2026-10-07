@@ -1694,6 +1694,24 @@ def restore_workspace_monitors(targets: list[dict]) -> tuple[int, int]:
     return moved, failed
 
 
+def fallback_terminal_workdir(win: dict) -> str:
+    """Where a terminal actually opens when its saved cwd is gone.
+
+    Ephemeral directories (/tmp/..., unplugged mounts, deleted projects) do
+    not survive a reboot, so the launcher falls back to HOME. Detection must
+    compare against that effective directory, not the stale saved path, or
+    the launched window scores 0 and is never claimed/moved (it stays as a
+    stray duplicate on the workspace it opened on).
+    """
+    workdir = win.get("restoreWorkdir") or ""
+    if workdir and Path(workdir).is_dir():
+        return workdir
+    home = str(Path.home())
+    if home and Path(home).is_dir():
+        return home
+    return ""
+
+
 def compatible_current_window(target: dict, candidate: dict) -> bool:
     if restore_key(candidate) == restore_key(target):
         return True
@@ -1717,8 +1735,11 @@ def compatible_current_window(target: dict, candidate: dict) -> bool:
 
     target_workdir = target.get("restoreWorkdir") or ""
     candidate_workdir = candidate.get("restoreWorkdir") or ""
-    if lc_class(target) in TERMINAL_CLASSES and target_workdir and target_workdir == candidate_workdir:
-        return True
+    if lc_class(target) in TERMINAL_CLASSES and target_workdir:
+        if target_workdir == candidate_workdir:
+            return True
+        if not Path(target_workdir).is_dir() and candidate_workdir == fallback_terminal_workdir(target):
+            return True
 
     return is_singleton(target)
 
@@ -1752,8 +1773,11 @@ def candidate_match_score(target: dict, candidate: dict) -> int:
 
     target_workdir = target.get("restoreWorkdir") or ""
     candidate_workdir = candidate.get("restoreWorkdir") or ""
-    if lc_class(target) in TERMINAL_CLASSES and target_workdir and target_workdir == candidate_workdir:
-        score = max(score, 75)
+    if lc_class(target) in TERMINAL_CLASSES and target_workdir:
+        if target_workdir == candidate_workdir:
+            score = max(score, 75)
+        elif not Path(target_workdir).is_dir() and candidate_workdir == fallback_terminal_workdir(target):
+            score = max(score, 55)
 
     if is_singleton(target):
         score = max(score, 60)
@@ -2397,22 +2421,25 @@ def launch_command(win: dict) -> tuple[list[str] | None, str]:
     elif cls in {"com.mitchellh.ghostty", "ghostty"}:
         restore_argv = terminal_restore_argv(win)
         cmd = ["ghostty"]
-        if workdir and Path(workdir).is_dir():
-            cmd.append(f"--working-directory={workdir}")
+        launch_dir = fallback_terminal_workdir(win)
+        if launch_dir:
+            cmd.append(f"--working-directory={launch_dir}")
         if restore_argv:
             cmd.extend(["-e", *terminal_exec_argv(restore_argv)])
     elif cls == "alacritty":
         restore_argv = terminal_restore_argv(win)
         cmd = ["alacritty"]
-        if workdir and Path(workdir).is_dir():
-            cmd.append(f"--working-directory={workdir}")
+        launch_dir = fallback_terminal_workdir(win)
+        if launch_dir:
+            cmd.append(f"--working-directory={launch_dir}")
         if restore_argv:
             cmd.extend(["-e", *terminal_exec_argv(restore_argv)])
     elif cls == "foot":
         restore_argv = terminal_restore_argv(win)
         cmd = ["foot"]
-        if workdir and Path(workdir).is_dir():
-            cmd.append(f"--working-directory={workdir}")
+        launch_dir = fallback_terminal_workdir(win)
+        if launch_dir:
+            cmd.append(f"--working-directory={launch_dir}")
         if restore_argv:
             cmd.extend(terminal_exec_argv(restore_argv))
     elif cls == "org.omarchy.agent":
@@ -2420,8 +2447,9 @@ def launch_command(win: dict) -> tuple[list[str] | None, str]:
         if not restore_argv:
             restore_argv = ["opencode", "--auto"]
         cmd = ["foot", "--app-id=org.omarchy.agent"]
-        if workdir and Path(workdir).is_dir():
-            cmd.append(f"--working-directory={workdir}")
+        launch_dir = fallback_terminal_workdir(win)
+        if launch_dir:
+            cmd.append(f"--working-directory={launch_dir}")
         cmd.extend(terminal_exec_argv(restore_argv))
     elif cls in {"chromium", "chromium-browser"}:
         cmd = ["chromium", *browser_profile_args(win)]
