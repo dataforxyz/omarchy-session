@@ -27,7 +27,7 @@ an audit report.
 - Session resume support for Pi, Claude Code, Codex, and OpenCode
 - Soft undo for the previous layout and hard undo for newly launched windows
 - Post-restore verification with concise failure summaries and a JSON audit
-- Walker, wofi, fuzzel, or rofi picker support, with a terminal fallback
+- Native Omarchy picker support (`omarchy-menu-select`), with Walker, wofi, fuzzel, rofi, and terminal fallbacks
 
 ## Requirements
 
@@ -41,7 +41,7 @@ Recommended or optional:
 
 - Ghostty or Alacritty for terminal restoration
 - `notify-send` for desktop notifications
-- Walker, wofi, fuzzel, or rofi for graphical profile selection
+- On Omarchy Quattro, `omarchy-menu-select` for native graphical profile selection; Walker, wofi, fuzzel, and rofi are fallback options
 - Pi, Claude Code, Codex, or OpenCode if their sessions should be resumed
 
 Check the current machine with:
@@ -60,8 +60,9 @@ scripts/install-omarchy-session.sh
 
 The installer copies the main script to `~/.local/bin/omarchy-session`, adds
 the `ws` and `restore-workspace` command shortcuts, and installs a **Workspace
-Sessions** launcher entry. On a standard Omarchy setup, open it with
-**Super+Space**; selecting it opens a session-actions submenu, including an
+Sessions** launcher entry. On the default Omarchy setup, open it with
+**Super+Space** (or search for “Workspace Sessions” in the launcher). Selecting it
+opens a session-actions submenu, including an
 action to save one selected workspace as any named profile. Existing unrelated
 files, symlinks, or desktop entries with those names are left untouched unless
 `--force` is supplied.
@@ -343,6 +344,31 @@ No personal wrapper name, forced model, permission mode, provider, or config pat
 belongs in this repository. Those choices remain in each user's local wrapper;
 the repository only provides this generic opt-in contract.
 
+## Omarchy Quattro and older releases
+
+Current `main` supports Quattro’s Lua dispatcher API and prefers the native
+`omarchy-menu-select` picker. It retains Walker, wofi, fuzzel, and rofi as
+fallbacks on other Hyprland systems. Session window actions are translated to
+Quattro’s `hl.dsp.*` dispatchers; saved launches use the native exec options to
+restore on their workspace without switching focus. A cancelled picker or a
+result that does not match a listed choice performs no restore.
+
+The launcher shortcut depends on the desktop’s own keybindings. Default Omarchy
+uses Super+Space, but personal setups may assign another key. Search the app
+launcher for **Workspace Sessions** if that shortcut opens something else.
+
+The previous `main` is preserved as the historical
+`archive/pre-quattro-20261115` branch. To inspect or check out that version:
+
+```bash
+git fetch origin
+git show origin/archive/pre-quattro-20261115:README.md
+git switch --detach origin/archive/pre-quattro-20261115
+```
+
+The archive is a point-in-time reference, not a maintained alternate release.
+Use the current `main` for Quattro and current Omarchy installs.
+
 ## Dry-run and verification
 
 Always preview an unfamiliar or old save first:
@@ -407,14 +433,3 @@ implementation details, limitations, undo behavior, and restore verification.
 Copyright (C) 2026 Ben U.
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).
-
-## Omarchy Quattro compatibility
-
-Session window operations use Hyprland’s native Lua dispatcher expressions.
-Restore launches preserve their saved workspace without switching focus. The
-native Omarchy picker is preferred, with the existing external menu fallbacks
-retained. Cancelling or returning an unknown label does not restore a session.
-
-Run `python3 -m unittest discover -s tests -v` for the test suite. Automated
-checks mock window actions; restoring an entire live desktop remains a manual
-acceptance check.

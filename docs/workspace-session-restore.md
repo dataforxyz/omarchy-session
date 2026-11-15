@@ -16,7 +16,7 @@ Installed commands:
 - `ws a` — write a timestamped autosave
 - `ws as` — list autosaves
 - `ws p` — list named profiles and recent autosaves
-- `ws pick` / `ws pk` — choose a named profile or recent autosave from Walker/wofi/fuzzel/rofi, falling back to a numbered terminal picker
+- `ws pick` / `ws pk` — choose a named profile or recent autosave with Omarchy Quattro’s native picker, Walker/wofi/fuzzel/rofi, or a numbered terminal picker
 - `ws pick plan` — choose any profile/autosave and print its read-only restore plan
 - `ws u` — soft undo: restore the pre-restore undo snapshot
 - `ws uh` / `ws undo-hard` — hard undo: close windows launched by the previous restore only
@@ -84,8 +84,9 @@ selection; otherwise restore preserves the user's current focus when possible.
 
 ## Partial restore
 
-`ws rs [name]` opens a toggle-and-reopen picker using Walker, wofi, fuzzel, rofi,
-or the numbered terminal fallback. Individual rows can be toggled directly; the
+`ws rs [name]` opens a toggle-and-reopen picker. On Omarchy Quattro it uses
+`omarchy-menu-select`; elsewhere it tries Walker, wofi, fuzzel, rofi, then the
+numbered terminal fallback. Individual rows can be toggled directly; the
 menu can also toggle every item in a saved workspace or Hyprland group, select
 all, clear the selection, restore the selected targets, or print their plan. If
 `name` is omitted, the profile/autosave picker opens first. `ws pick select` is an
@@ -244,3 +245,29 @@ Terminal restore behavior is best effort:
   rerunning the original `make` command in the saved working directory;
 - unknown terminal workflows fall back to reopening the saved terminal app in the
   saved working directory when supported.
+
+## Omarchy Quattro compatibility and archived versions
+
+Current `main` targets current Omarchy, including Quattro. On Quattro, window
+operations use native Hyprland Lua dispatcher expressions, and restore launches
+use native exec options to return to a saved workspace without changing the
+current workspace. Interactive selection prefers `omarchy-menu-select`; older
+Walker/wofi/fuzzel/rofi and terminal fallbacks remain available on other systems.
+Cancelling a picker or returning a label outside the offered choices performs no
+action.
+
+The launcher entry is named **Workspace Sessions**. Its key follows the desktop’s
+app-launcher binding: default Omarchy uses Super+Space, while personal setups can
+assign another key. Search the launcher by name if the shortcut opens another
+menu.
+
+The previous `main` is kept on `archive/pre-quattro-20261115` as a historical
+reference, not a maintained release. Inspect or check it out with:
+
+```bash
+git fetch origin
+git show origin/archive/pre-quattro-20261115:docs/workspace-session-restore.md
+git switch --detach origin/archive/pre-quattro-20261115
+```
+
+Use current `main` for current Omarchy installs.
