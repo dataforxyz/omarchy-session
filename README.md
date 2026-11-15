@@ -407,3 +407,14 @@ implementation details, limitations, undo behavior, and restore verification.
 Copyright (C) 2026 Ben U.
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).
+
+## Omarchy Quattro compatibility
+
+Session window operations use Hyprland’s native Lua dispatcher expressions.
+Restore launches preserve their saved workspace without switching focus. The
+native Omarchy picker is preferred, with the existing external menu fallbacks
+retained. Cancelling or returning an unknown label does not restore a session.
+
+Run `python3 -m unittest discover -s tests -v` for the test suite. Automated
+checks mock window actions; restoring an entire live desktop remains a manual
+acceptance check.

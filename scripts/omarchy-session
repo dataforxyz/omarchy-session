@@ -62,7 +62,7 @@ VERBOSE = False
 OPTIONAL_COMMAND_GROUPS = {
     "terminal restore": ("ghostty", "alacritty"),
     "notifications/session supervision": ("notify-send", "uwsm"),
-    "pick menu": ("walker", "wofi", "fuzzel", "rofi"),
+    "pick menu": ("omarchy-menu-select", "walker", "wofi", "fuzzel", "rofi"),
     "web apps": ("omarchy-launch-webapp",),
     "app restore targets": (
         "chromium", "brave", "google-chrome-stable", "firefox", "zen-browser", "obsidian", "slack",
@@ -1573,7 +1573,59 @@ def first_available_command(commands: list[str]) -> str:
     return commands[0] if commands else ""
 
 
+def lua_string(value: str) -> str:
+    # Lua accepts UTF-8 strings but not JSON's \uXXXX control escapes.
+    escaped = []
+    for char in str(value):
+        if char in ('"', "\\"):
+            escaped.append("\\" + char)
+        elif ord(char) < 32 or ord(char) == 127:
+            escaped.append("\\" + f"{ord(char):03d}")
+        else:
+            escaped.append(char)
+    return '"' + "".join(escaped) + '"'
+
+
+def session_dispatch_expression(command: str, argument: str = "") -> str:
+    """Translate this tool's internal actions to Quattro's native Lua API."""
+    quote = lua_string
+    if command.startswith("hl.dsp."):
+        return command
+    if command == "focuswindow":
+        return f"hl.dsp.focus({{ window = {quote(argument)} }})"
+    if command == "workspace":
+        return f"hl.dsp.focus({{ workspace = {quote(argument)} }})"
+    if command == "moveworkspacetomonitor":
+        workspace, monitor = argument.rsplit(" ", 1)
+        return f"hl.dsp.workspace.move({{ workspace = {quote(workspace)}, monitor = {quote(monitor)} }})"
+    if command == "movetoworkspacesilent":
+        workspace, window = argument.rsplit(",address:", 1)
+        return f"hl.dsp.window.move({{ workspace = {quote(workspace)}, follow = false, window = {quote('address:' + window)} }})"
+    if command == "setfloating":
+        return f"hl.dsp.window.float({{ action = \"on\", window = {quote(argument)} }})"
+    if command in ("resizewindowpixel", "movewindowpixel"):
+        geometry, window = argument.rsplit(",address:", 1)
+        match = re.fullmatch(r"exact (-?\d+(?:\.\d+)?) (-?\d+(?:\.\d+)?)", geometry)
+        if not match:
+            raise ValueError("invalid geometry")
+        x, y = match.groups()
+        action = "resize" if command == "resizewindowpixel" else "move"
+        return f"hl.dsp.window.{action}({{ x = {x}, y = {y}, relative = false, window = {quote('address:' + window)} }})"
+    if command == "togglegroup":
+        return "hl.dsp.group.toggle()"
+    if command == "moveintogroup" and argument in ("l", "r", "u", "d"):
+        return f"hl.dsp.window.move({{ into_group = {quote(argument)} }})"
+    if command == "closewindow":
+        return f"hl.dsp.window.close({{ window = {quote(argument)} }})"
+    raise ValueError(f"unsupported session action: {command}")
+
+
 def hypr(*args: str, retries: int = 1, delay: float = 0.08) -> bool:
+    if args and args[0] == "dispatch":
+        try:
+            args = ("dispatch", session_dispatch_expression(args[1], args[2] if len(args) > 2 else ""))
+        except (ValueError, IndexError):
+            return False
     for attempt in range(retries + 1):
         try:
             result = subprocess.run(["hyprctl", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1587,10 +1639,10 @@ def hypr(*args: str, retries: int = 1, delay: float = 0.08) -> bool:
 
 
 def hypr_exec_on_workspace(cmd: list[str], ws: str) -> bool:
-    # Hyprland exec rules launch on the target workspace without switching your
-    # current focus there. This avoids restore yanking you around.
-    rule = f"[workspace {ws} silent] " if ws else ""
-    return hypr("dispatch", "exec", rule + shlex.join(uwsm_cmd(cmd)), retries=2)
+    # Native exec options launch silently on the saved workspace.
+    command = lua_string(shlex.join(uwsm_cmd(cmd)))
+    options = f", {{ workspace = {lua_string(str(ws) + ' silent')} }}" if ws else ""
+    return hypr("dispatch", f"hl.dsp.exec_cmd({command}{options})", retries=2)
 
 
 def monitor_target(win: dict) -> str:
@@ -3059,6 +3111,7 @@ def list_profiles() -> None:
 
 def run_menu(labels: list[str], prompt: str) -> str:
     menu_cmds = [
+        ["omarchy-menu-select", prompt, "--", "--width", "720", "--maxheight", "600"],
         ["walker", "--dmenu", "--exit", "--placeholder", prompt],
         ["wofi", "--dmenu", "--prompt", prompt],
         ["fuzzel", "--dmenu", "--prompt", f"{prompt}: "],
@@ -3071,8 +3124,9 @@ def run_menu(labels: list[str], prompt: str) -> str:
             result = subprocess.run(cmd, input="\n".join(labels) + "\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except Exception:
             continue
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip().splitlines()[-1]
+        if result.returncode == 0:
+            choice = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+            return choice if choice in labels else ""
         if result.returncode != 0:
             return ""
 
